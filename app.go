@@ -1,0 +1,578 @@
+package main
+
+import (
+	"context"
+	"fmt"
+	"path/filepath"
+
+	"github.com/run-bigpig/jcp/internal/adk/mcp"
+	"github.com/run-bigpig/jcp/internal/adk/tools"
+	"github.com/run-bigpig/jcp/internal/agent"
+	"github.com/run-bigpig/jcp/internal/meeting"
+	"github.com/run-bigpig/jcp/internal/models"
+	"github.com/run-bigpig/jcp/internal/services"
+	"github.com/run-bigpig/jcp/internal/services/hottrend"
+
+	"github.com/wailsapp/wails/v2/pkg/runtime"
+)
+
+// App struct
+type App struct {
+	ctx                context.Context
+	configService      *services.ConfigService
+	marketService      *services.MarketService
+	newsService        *services.NewsService
+	hotTrendService    *hottrend.HotTrendService
+	marketPusher       *services.MarketDataPusher
+	meetingService     *meeting.Service
+	sessionService     *services.SessionService
+	agentConfigService *services.AgentConfigService
+	agentContainer     *agent.Container
+	toolRegistry       *tools.Registry
+	mcpManager         *mcp.Manager
+}
+
+// NewApp creates a new App application struct
+func NewApp() *App {
+	return &App{
+		marketService: services.NewMarketService(),
+		newsService:   services.NewNewsService(),
+	}
+}
+
+// startup is called when the app starts. The context is saved
+// so we can call the runtime methods
+func (a *App) startup(ctx context.Context) {
+	a.ctx = ctx
+
+	// 初始化配置服务
+	dataDir := filepath.Join(".", "data")
+	configService, err := services.NewConfigService(dataDir)
+	if err != nil {
+		panic(err)
+	}
+	a.configService = configService
+
+	// 初始化研报服务
+	researchReportService := services.NewResearchReportService()
+
+	// 初始化舆情热点服务
+	hotTrendSvc, err := hottrend.NewHotTrendService()
+	if err != nil {
+		fmt.Println("[startup] HotTrend service error:", err)
+	}
+	a.hotTrendService = hotTrendSvc
+
+	// 初始化工具注册中心
+	toolRegistry := tools.NewRegistry(a.marketService, a.newsService, a.configService, researchReportService, hotTrendSvc)
+	a.toolRegistry = toolRegistry
+
+	// 初始化 MCP 管理器
+	a.mcpManager = mcp.NewManager()
+	if err := a.mcpManager.LoadConfigs(a.configService.GetConfig().MCPServers); err != nil {
+		fmt.Println("[startup] MCP load error:", err)
+	}
+
+	// 初始化会议室服务（带工具和 MCP 支持）
+	a.meetingService = meeting.NewServiceFull(toolRegistry, a.mcpManager)
+
+	// 初始化Session服务
+	a.sessionService = services.NewSessionService()
+
+	// 初始化Agent配置服务和容器
+	a.agentConfigService = services.NewAgentConfigService()
+	a.agentContainer = agent.NewContainer()
+	a.agentContainer.LoadAgents(a.agentConfigService.GetAllAgents())
+
+	// 初始化并启动市场数据推送服务
+	a.marketPusher = services.NewMarketDataPusher(a.marketService, a.configService, a.newsService)
+	a.marketPusher.Start(ctx)
+}
+
+// shutdown 应用关闭时调用
+func (a *App) shutdown(ctx context.Context) {
+	if a.marketPusher != nil {
+		a.marketPusher.Stop()
+	}
+}
+
+// Greet returns a greeting for the given name
+func (a *App) Greet(name string) string {
+	return "Hello " + name + ", It's show time!"
+}
+
+// GetConfig 获取配置
+func (a *App) GetConfig() *models.AppConfig {
+	return a.configService.GetConfig()
+}
+
+// UpdateConfig 更新配置
+func (a *App) UpdateConfig(config *models.AppConfig) string {
+	if err := a.configService.UpdateConfig(config); err != nil {
+		return err.Error()
+	}
+	// 重新加载 MCP 配置
+	if a.mcpManager != nil && config.MCPServers != nil {
+		if err := a.mcpManager.LoadConfigs(config.MCPServers); err != nil {
+			fmt.Println("[UpdateConfig] MCP reload error:", err)
+		}
+	}
+	return "success"
+}
+
+// GetWatchlist 获取自选股列表
+func (a *App) GetWatchlist() []models.Stock {
+	return a.configService.GetWatchlist()
+}
+
+// AddToWatchlist 添加自选股
+func (a *App) AddToWatchlist(stock models.Stock) string {
+	if err := a.configService.AddToWatchlist(stock); err != nil {
+		return err.Error()
+	}
+	// 同步添加到推送订阅
+	a.marketPusher.AddSubscription(stock.Symbol)
+	return "success"
+}
+
+// RemoveFromWatchlist 移除自选股
+func (a *App) RemoveFromWatchlist(symbol string) string {
+	if err := a.configService.RemoveFromWatchlist(symbol); err != nil {
+		return err.Error()
+	}
+	// 同步移除推送订阅
+	a.marketPusher.RemoveSubscription(symbol)
+	// 清空该股票的聊天记录
+	a.sessionService.ClearMessages(symbol)
+	return "success"
+}
+
+// GetStockRealTimeData 获取股票实时数据
+func (a *App) GetStockRealTimeData(codes []string) []models.Stock {
+	stocks, _ := a.marketService.GetStockRealTimeData(codes...)
+	return stocks
+}
+
+// GetKLineData 获取K线数据
+func (a *App) GetKLineData(code string, period string, days int) []models.KLineData {
+	data, _ := a.marketService.GetKLineData(code, period, days)
+	return data
+}
+
+// GetOrderBook 获取盘口数据（真实五档）
+func (a *App) GetOrderBook(code string) models.OrderBook {
+	orderBook, _ := a.marketService.GetRealOrderBook(code)
+	return orderBook
+}
+
+// SearchStocks 搜索股票
+func (a *App) SearchStocks(keyword string) []services.StockSearchResult {
+	return a.configService.SearchStocks(keyword, 20)
+}
+
+// GetMarketStatus 获取市场交易状态
+func (a *App) GetMarketStatus() services.MarketStatus {
+	return a.marketService.GetMarketStatus()
+}
+
+// GetMarketIndices 获取大盘指数数据
+func (a *App) GetMarketIndices() []models.MarketIndex {
+	indices, _ := a.marketService.GetMarketIndices()
+	return indices
+}
+
+// getDefaultAIConfig 获取默认AI配置
+func (a *App) getDefaultAIConfig(config *models.AppConfig) *models.AIConfig {
+	for i := range config.AIConfigs {
+		if config.AIConfigs[i].ID == config.DefaultAIID {
+			return &config.AIConfigs[i]
+		}
+		if config.AIConfigs[i].IsDefault {
+			return &config.AIConfigs[i]
+		}
+	}
+	if len(config.AIConfigs) > 0 {
+		return &config.AIConfigs[0]
+	}
+	return nil
+}
+
+// ========== Session API ==========
+
+// GetOrCreateSession 获取或创建Session
+func (a *App) GetOrCreateSession(stockCode, stockName string) *models.StockSession {
+	session, _ := a.sessionService.GetOrCreateSession(stockCode, stockName)
+	return session
+}
+
+// GetSessionMessages 获取Session消息
+func (a *App) GetSessionMessages(stockCode string) []models.ChatMessage {
+	return a.sessionService.GetMessages(stockCode)
+}
+
+// ClearSessionMessages 清空Session消息
+func (a *App) ClearSessionMessages(stockCode string) string {
+	if err := a.sessionService.ClearMessages(stockCode); err != nil {
+		return err.Error()
+	}
+	return "success"
+}
+
+// UpdateStockPosition 更新股票持仓信息
+func (a *App) UpdateStockPosition(stockCode string, shares int64, costPrice float64) string {
+	if err := a.sessionService.UpdatePosition(stockCode, shares, costPrice); err != nil {
+		return err.Error()
+	}
+	return "success"
+}
+
+// ========== Agent Config API ==========
+
+// GetAgentConfigs 获取所有Agent配置
+func (a *App) GetAgentConfigs() []models.AgentConfig {
+	return a.agentConfigService.GetAllAgents()
+}
+
+// AddAgentConfig 添加Agent配置
+func (a *App) AddAgentConfig(config models.AgentConfig) string {
+	if err := a.agentConfigService.AddAgent(config); err != nil {
+		return err.Error()
+	}
+	// 重新加载容器
+	a.agentContainer.LoadAgents(a.agentConfigService.GetAllAgents())
+	return "success"
+}
+
+// UpdateAgentConfig 更新Agent配置
+func (a *App) UpdateAgentConfig(config models.AgentConfig) string {
+	if err := a.agentConfigService.UpdateAgent(config); err != nil {
+		return err.Error()
+	}
+	a.agentContainer.LoadAgents(a.agentConfigService.GetAllAgents())
+	return "success"
+}
+
+// DeleteAgentConfig 删除Agent配置
+func (a *App) DeleteAgentConfig(id string) string {
+	if err := a.agentConfigService.DeleteAgent(id); err != nil {
+		return err.Error()
+	}
+	a.agentContainer.LoadAgents(a.agentConfigService.GetAllAgents())
+	return "success"
+}
+
+// ========== Meeting Room API ==========
+
+// MeetingMessageRequest 会议室消息请求
+type MeetingMessageRequest struct {
+	StockCode    string   `json:"stockCode"`
+	Content      string   `json:"content"`
+	MentionIds   []string `json:"mentionIds"`
+	ReplyToId    string   `json:"replyToId"`
+	ReplyContent string   `json:"replyContent"`
+}
+
+// SendMeetingMessage 发送会议室消息（@指定成员回复）
+func (a *App) SendMeetingMessage(req MeetingMessageRequest) []models.ChatMessage {
+	// 获取Session
+	session := a.sessionService.GetSession(req.StockCode)
+	if session == nil {
+		fmt.Println("[SendMeetingMessage] session not found:", req.StockCode)
+		return []models.ChatMessage{}
+	}
+
+	// 先保存用户消息
+	userMsg := models.ChatMessage{
+		AgentID:   "user",
+		AgentName: "老韭菜",
+		Content:   req.Content,
+		ReplyTo:   req.ReplyToId,
+		Mentions:  req.MentionIds,
+	}
+	a.sessionService.AddMessage(req.StockCode, userMsg)
+
+	// 获取股票数据
+	stocks, _ := a.marketService.GetStockRealTimeData(req.StockCode)
+	var stock models.Stock
+	if len(stocks) > 0 {
+		stock = stocks[0]
+	}
+
+	// 获取默认AI配置
+	config := a.configService.GetConfig()
+	aiConfig := a.getDefaultAIConfig(config)
+	if aiConfig == nil {
+		fmt.Println("[SendMeetingMessage] no AI config found")
+		return []models.ChatMessage{}
+	}
+
+	// 获取持仓信息
+	position := a.sessionService.GetPosition(req.StockCode)
+
+	// 判断是否为智能模式（无 @ 任何人）
+	if len(req.MentionIds) == 0 {
+		return a.runSmartMeeting(req.StockCode, stock, req.Content, aiConfig, position)
+	}
+
+	// 原有逻辑：@ 指定专家
+	return a.runDirectMeeting(req, stock, aiConfig, position)
+}
+
+// runSmartMeeting 智能会议模式
+func (a *App) runSmartMeeting(stockCode string, stock models.Stock, query string, aiConfig *models.AIConfig, position *models.StockPosition) []models.ChatMessage {
+	allAgents := a.agentConfigService.GetAllAgents()
+	chatReq := meeting.ChatRequest{
+		Stock:     stock,
+		Query:     query,
+		AllAgents: allAgents,
+		Position:  position,
+	}
+
+	// 响应回调：每次发言完成后推送
+	respCallback := func(resp meeting.ChatResponse) {
+		msg := models.ChatMessage{
+			AgentID:   resp.AgentID,
+			AgentName: resp.AgentName,
+			Role:      resp.Role,
+			Content:   resp.Content,
+			Round:     resp.Round,
+			MsgType:   resp.MsgType,
+		}
+		a.sessionService.AddMessage(stockCode, msg)
+		runtime.EventsEmit(a.ctx, "meeting:message:"+stockCode, msg)
+	}
+
+	// 进度回调：工具调用、流式输出等细粒度事件
+	progressCallback := func(event meeting.ProgressEvent) {
+		runtime.EventsEmit(a.ctx, "meeting:progress:"+stockCode, event)
+	}
+
+	responses, err := a.meetingService.RunSmartMeetingWithCallback(a.ctx, aiConfig, chatReq, respCallback, progressCallback)
+	if err != nil {
+		fmt.Println("[runSmartMeeting] error:", err)
+		return []models.ChatMessage{}
+	}
+
+	// 返回所有响应（前端可能已通过事件收到，这里作为备份）
+	var messages []models.ChatMessage
+	for _, resp := range responses {
+		messages = append(messages, models.ChatMessage{
+			AgentID:   resp.AgentID,
+			AgentName: resp.AgentName,
+			Role:      resp.Role,
+			Content:   resp.Content,
+			Round:     resp.Round,
+			MsgType:   resp.MsgType,
+		})
+	}
+	return messages
+}
+
+// runDirectMeeting 直接 @ 指定专家模式（带事件推送）
+func (a *App) runDirectMeeting(req MeetingMessageRequest, stock models.Stock, aiConfig *models.AIConfig, position *models.StockPosition) []models.ChatMessage {
+	agentConfigs := a.agentConfigService.GetAgentsByIDs(req.MentionIds)
+	if len(agentConfigs) == 0 {
+		return []models.ChatMessage{}
+	}
+
+	chatReq := meeting.ChatRequest{
+		Stock:        stock,
+		Agents:       agentConfigs,
+		Query:        req.Content,
+		ReplyContent: req.ReplyContent,
+		Position:     position,
+	}
+
+	responses, err := a.meetingService.SendMessage(a.ctx, aiConfig, chatReq)
+	if err != nil {
+		fmt.Println("[runDirectMeeting] error:", err)
+		return []models.ChatMessage{}
+	}
+
+	// 转换并保存响应，同时推送事件
+	return a.convertSaveAndEmitResponses(req.StockCode, responses, req.ReplyToId)
+}
+
+// convertAndSaveResponses 转换响应并保存
+func (a *App) convertAndSaveResponses(stockCode string, responses []meeting.ChatResponse, replyTo string) []models.ChatMessage {
+	var messages []models.ChatMessage
+	for _, resp := range responses {
+		messages = append(messages, models.ChatMessage{
+			AgentID:   resp.AgentID,
+			AgentName: resp.AgentName,
+			Role:      resp.Role,
+			Content:   resp.Content,
+			ReplyTo:   replyTo,
+			Round:     resp.Round,
+			MsgType:   resp.MsgType,
+		})
+	}
+	a.sessionService.AddMessages(stockCode, messages)
+	return messages
+}
+
+// convertSaveAndEmitResponses 转换响应、保存并推送事件（统一体验）
+func (a *App) convertSaveAndEmitResponses(stockCode string, responses []meeting.ChatResponse, replyTo string) []models.ChatMessage {
+	var messages []models.ChatMessage
+	for _, resp := range responses {
+		msg := models.ChatMessage{
+			AgentID:   resp.AgentID,
+			AgentName: resp.AgentName,
+			Role:      resp.Role,
+			Content:   resp.Content,
+			ReplyTo:   replyTo,
+			Round:     resp.Round,
+			MsgType:   resp.MsgType,
+		}
+		// 保存单条消息
+		a.sessionService.AddMessage(stockCode, msg)
+		// 推送事件（与智能模式一致）
+		runtime.EventsEmit(a.ctx, "meeting:message:"+stockCode, msg)
+		messages = append(messages, msg)
+	}
+	return messages
+}
+
+// ========== News API ==========
+
+// GetTelegraphList 获取快讯列表
+func (a *App) GetTelegraphList() []services.Telegraph {
+	telegraphs, err := a.newsService.GetTelegraphList()
+	if err != nil {
+		return []services.Telegraph{}
+	}
+	return telegraphs
+}
+
+// OpenURL 在浏览器中打开URL
+func (a *App) OpenURL(url string) {
+	runtime.BrowserOpenURL(a.ctx, url)
+}
+
+// ========== Tools API ==========
+
+// GetAvailableTools 获取可用的内置工具列表
+func (a *App) GetAvailableTools() []tools.ToolInfo {
+	return a.toolRegistry.GetAllToolInfos()
+}
+
+// ========== MCP API ==========
+
+// GetMCPServers 获取 MCP 服务器配置列表
+func (a *App) GetMCPServers() []models.MCPServerConfig {
+	config := a.configService.GetConfig()
+	if config.MCPServers == nil {
+		return []models.MCPServerConfig{}
+	}
+	return config.MCPServers
+}
+
+// AddMCPServer 添加 MCP 服务器配置
+func (a *App) AddMCPServer(server models.MCPServerConfig) string {
+	config := a.configService.GetConfig()
+	config.MCPServers = append(config.MCPServers, server)
+	if err := a.configService.UpdateConfig(config); err != nil {
+		return err.Error()
+	}
+	// 重新加载 MCP 配置
+	if err := a.mcpManager.LoadConfigs(config.MCPServers); err != nil {
+		return err.Error()
+	}
+	return "success"
+}
+
+// UpdateMCPServer 更新 MCP 服务器配置
+func (a *App) UpdateMCPServer(server models.MCPServerConfig) string {
+	config := a.configService.GetConfig()
+	for i, s := range config.MCPServers {
+		if s.ID == server.ID {
+			config.MCPServers[i] = server
+			break
+		}
+	}
+	if err := a.configService.UpdateConfig(config); err != nil {
+		return err.Error()
+	}
+	if err := a.mcpManager.LoadConfigs(config.MCPServers); err != nil {
+		return err.Error()
+	}
+	return "success"
+}
+
+// DeleteMCPServer 删除 MCP 服务器配置
+func (a *App) DeleteMCPServer(id string) string {
+	config := a.configService.GetConfig()
+	var newServers []models.MCPServerConfig
+	for _, s := range config.MCPServers {
+		if s.ID != id {
+			newServers = append(newServers, s)
+		}
+	}
+	config.MCPServers = newServers
+	if err := a.configService.UpdateConfig(config); err != nil {
+		return err.Error()
+	}
+	if err := a.mcpManager.LoadConfigs(config.MCPServers); err != nil {
+		return err.Error()
+	}
+	return "success"
+}
+
+// GetMCPStatus 获取所有 MCP 服务器连接状态
+func (a *App) GetMCPStatus() []mcp.ServerStatus {
+	return a.mcpManager.GetAllStatus()
+}
+
+// TestMCPConnection 测试指定 MCP 服务器连接
+func (a *App) TestMCPConnection(serverID string) *mcp.ServerStatus {
+	return a.mcpManager.TestConnection(serverID)
+}
+
+// GetMCPServerTools 获取指定 MCP 服务器的工具列表
+func (a *App) GetMCPServerTools(serverID string) []mcp.ToolInfo {
+	tools, err := a.mcpManager.GetServerTools(serverID)
+	if err != nil {
+		return []mcp.ToolInfo{}
+	}
+	return tools
+}
+
+// ========== Window Control API ==========
+
+// WindowMinimize 最小化窗口
+func (a *App) WindowMinimize() {
+	runtime.WindowMinimise(a.ctx)
+}
+
+// WindowMaximize 最大化/还原窗口
+func (a *App) WindowMaximize() {
+	runtime.WindowToggleMaximise(a.ctx)
+}
+
+// WindowClose 关闭窗口
+func (a *App) WindowClose() {
+	runtime.Quit(a.ctx)
+}
+
+// ========== HotTrend API ==========
+
+// GetHotTrendPlatforms 获取支持的热点平台列表
+func (a *App) GetHotTrendPlatforms() []hottrend.PlatformInfo {
+	return hottrend.SupportedPlatforms
+}
+
+// GetHotTrend 获取单个平台的热点数据
+func (a *App) GetHotTrend(platform string) hottrend.HotTrendResult {
+	if a.hotTrendService == nil {
+		return hottrend.HotTrendResult{Platform: platform, Error: "服务未初始化"}
+	}
+	return a.hotTrendService.GetHotTrend(platform)
+}
+
+// GetAllHotTrends 获取所有平台的热点数据
+func (a *App) GetAllHotTrends() []hottrend.HotTrendResult {
+	if a.hotTrendService == nil {
+		return []hottrend.HotTrendResult{}
+	}
+	return a.hotTrendService.GetAllHotTrends()
+}

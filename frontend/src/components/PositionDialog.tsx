@@ -1,0 +1,160 @@
+import React, { useState, useEffect } from 'react';
+import { X, Briefcase } from 'lucide-react';
+import type { StockPosition } from '../types';
+
+interface PositionDialogProps {
+  isOpen: boolean;
+  onClose: () => void;
+  stockCode: string;
+  stockName: string;
+  currentPrice: number;
+  position?: StockPosition;
+  onSave: (shares: number, costPrice: number) => void;
+}
+
+export const PositionDialog: React.FC<PositionDialogProps> = ({
+  isOpen,
+  onClose,
+  stockCode,
+  stockName,
+  currentPrice,
+  position,
+  onSave,
+}) => {
+  const [shares, setShares] = useState<string>('');
+  const [costPrice, setCostPrice] = useState<string>('');
+
+  useEffect(() => {
+    if (isOpen && position) {
+      setShares(position.shares > 0 ? position.shares.toString() : '');
+      setCostPrice(position.costPrice > 0 ? position.costPrice.toString() : '');
+    } else if (isOpen) {
+      setShares('');
+      setCostPrice('');
+    }
+  }, [isOpen, position]);
+
+  if (!isOpen) return null;
+
+  const sharesNum = parseInt(shares) || 0;
+  const costPriceNum = parseFloat(costPrice) || 0;
+  const costAmount = sharesNum * costPriceNum;
+  const marketValue = sharesNum * currentPrice;
+  const profitLoss = marketValue - costAmount;
+  const profitLossPercent = costAmount > 0 ? (profitLoss / costAmount) * 100 : 0;
+
+  const handleSave = () => {
+    onSave(sharesNum, costPriceNum);
+    onClose();
+  };
+
+  const handleClear = () => {
+    onSave(0, 0);
+    onClose();
+  };
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center">
+      <div className="absolute inset-0 bg-black/60" onClick={onClose} />
+      <div className="relative w-96 fin-panel border fin-divider rounded-xl shadow-2xl">
+        {/* Header */}
+        <div className="flex items-center justify-between p-4 border-b fin-divider">
+          <div className="flex items-center gap-2">
+            <Briefcase className="h-5 w-5 text-cyan-400" />
+            <span className="font-bold text-slate-100">持仓设置</span>
+          </div>
+          <button
+            onClick={onClose}
+            className="p-1 rounded hover:bg-slate-700 text-slate-400 hover:text-white transition-colors"
+          >
+            <X className="h-5 w-5" />
+          </button>
+        </div>
+
+        {/* Stock Info */}
+        <div className="px-4 py-3 border-b fin-divider bg-slate-800/30">
+          <div className="flex justify-between items-center">
+            <div>
+              <span className="text-slate-100 font-medium">{stockName}</span>
+              <span className="ml-2 text-sm text-slate-400 font-mono">{stockCode}</span>
+            </div>
+            <span className="text-lg font-mono text-cyan-400">{currentPrice.toFixed(2)}</span>
+          </div>
+        </div>
+
+        {/* Form */}
+        <div className="p-4 space-y-4">
+          <div>
+            <label className="block text-sm text-slate-400 mb-1">持仓数量（股）</label>
+            <input
+              type="number"
+              value={shares}
+              onChange={(e) => setShares(e.target.value)}
+              placeholder="请输入持仓数量"
+              className="w-full fin-input rounded-lg px-3 py-2 text-sm"
+              min="0"
+              step="100"
+            />
+          </div>
+          <div>
+            <label className="block text-sm text-slate-400 mb-1">成本价（元）</label>
+            <input
+              type="number"
+              value={costPrice}
+              onChange={(e) => setCostPrice(e.target.value)}
+              placeholder="请输入成本价"
+              className="w-full fin-input rounded-lg px-3 py-2 text-sm"
+              min="0"
+              step="0.01"
+            />
+          </div>
+
+          {/* Calculated Info */}
+          {sharesNum > 0 && costPriceNum > 0 && (
+            <div className="p-3 rounded-lg bg-slate-800/50 space-y-2 text-sm">
+              <div className="flex justify-between">
+                <span className="text-slate-400">成本金额</span>
+                <span className="text-slate-200 font-mono">{costAmount.toFixed(2)}</span>
+              </div>
+              <div className="flex justify-between">
+                <span className="text-slate-400">市值</span>
+                <span className="text-slate-200 font-mono">{marketValue.toFixed(2)}</span>
+              </div>
+              <div className="flex justify-between">
+                <span className="text-slate-400">盈亏</span>
+                <span className={`font-mono ${profitLoss >= 0 ? 'text-red-500' : 'text-green-500'}`}>
+                  {profitLoss >= 0 ? '+' : ''}{profitLoss.toFixed(2)} ({profitLossPercent >= 0 ? '+' : ''}{profitLossPercent.toFixed(2)}%)
+                </span>
+              </div>
+            </div>
+          )}
+        </div>
+
+        {/* Footer */}
+        <div className="flex gap-2 p-4 border-t fin-divider">
+          {position && position.shares > 0 && (
+            <button
+              onClick={handleClear}
+              className="px-4 py-2 rounded-lg text-sm text-red-400 hover:bg-red-500/10 transition-colors"
+            >
+              清空持仓
+            </button>
+          )}
+          <div className="flex-1" />
+          <button
+            onClick={onClose}
+            className="px-4 py-2 rounded-lg text-sm text-slate-400 hover:bg-slate-700 transition-colors"
+          >
+            取消
+          </button>
+          <button
+            onClick={handleSave}
+            className="px-4 py-2 rounded-lg text-sm bg-cyan-500 hover:bg-cyan-600 text-white transition-colors"
+          >
+            保存
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+};
