@@ -507,7 +507,8 @@ func (ms *MarketService) GenerateOrderBook(price float64) models.OrderBook {
 func (ms *MarketService) GetMarketStatus() MarketStatus {
 	log.Debug("开始获取市场状态")
 	now := time.Now()
-	loc, _ := time.LoadLocation("Asia/Shanghai")
+	// 使用固定时区 UTC+8，避免 Windows 缺少时区数据库的问题
+	loc := time.FixedZone("CST", 8*60*60)
 	now = now.In(loc)
 	log.Debug("当前时间: %s, 星期: %s", now.Format("2006-01-02 15:04:05"), now.Weekday())
 
