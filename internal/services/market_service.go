@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -20,6 +21,12 @@ import (
 )
 
 var log = logger.New("market")
+
+// 预编译正则表达式，避免重复编译
+var (
+	sinaStockRegex = regexp.MustCompile(`var hq_str_(\w+)="([^"]*)"`)
+	sinaIndexRegex = regexp.MustCompile(`var hq_str_s_(\w+)="([^"]*)"`)
+)
 
 const (
 	sinaStockURL  = "http://hq.sinajs.cn/rn=%d&list=%s"
@@ -43,6 +50,12 @@ type StockWithOrderBook struct {
 // stockCache 股票数据缓存
 type stockCache struct {
 	data      []StockWithOrderBook
+	timestamp time.Time
+}
+
+// klineCache K线数据缓存
+type klineCache struct {
+	data      []models.KLineData
 	timestamp time.Time
 }
 
@@ -70,6 +83,11 @@ type MarketService struct {
 	cacheMu  sync.RWMutex
 	cacheTTL time.Duration
 
+	// K线数据缓存
+	klineCache   map[string]*klineCache
+	klineCacheMu sync.RWMutex
+	klineCacheTTL time.Duration
+
 	// 当天节假日缓存
 	todayCache   *todayHolidayCache
 	todayCacheMu sync.RWMutex
@@ -77,11 +95,48 @@ type MarketService struct {
 
 // NewMarketService 创建市场数据服务
 func NewMarketService() *MarketService {
-	return &MarketService{
-		client:   proxy.GetManager().GetClientWithTimeout(10 * time.Second),
-		cache:    make(map[string]*stockCache),
-		cacheTTL: 2 * time.Second, // 缓存2秒，避免频繁请求
+	ms := &MarketService{
+		client:        proxy.GetManager().GetClientWithTimeout(10 * time.Second),
+		cache:         make(map[string]*stockCache),
+		cacheTTL:      2 * time.Second, // 股票缓存2秒
+		klineCache:    make(map[string]*klineCache),
+		klineCacheTTL: 2 * time.Second, // K线缓存2秒
 	}
+	// 启动缓存清理协程
+	go ms.cleanCacheLoop()
+	return ms
+}
+
+// cleanCacheLoop 定期清理过期缓存，防止内存泄漏
+func (ms *MarketService) cleanCacheLoop() {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+	for range ticker.C {
+		ms.cleanExpiredCache()
+	}
+}
+
+// cleanExpiredCache 清理过期缓存
+func (ms *MarketService) cleanExpiredCache() {
+	now := time.Now()
+
+	// 清理股票缓存
+	ms.cacheMu.Lock()
+	for key, cached := range ms.cache {
+		if now.Sub(cached.timestamp) > 10*time.Second {
+			delete(ms.cache, key)
+		}
+	}
+	ms.cacheMu.Unlock()
+
+	// 清理K线缓存
+	ms.klineCacheMu.Lock()
+	for key, cached := range ms.klineCache {
+		if now.Sub(cached.timestamp) > 10*time.Second {
+			delete(ms.klineCache, key)
+		}
+	}
+	ms.klineCacheMu.Unlock()
 }
 
 // GetStockDataWithOrderBook 获取股票实时数据（含真实盘口），带缓存
@@ -90,7 +145,11 @@ func (ms *MarketService) GetStockDataWithOrderBook(codes ...string) ([]StockWith
 		return nil, nil
 	}
 
-	cacheKey := strings.Join(codes, ",")
+	// 排序codes保证缓存key一致性
+	sortedCodes := make([]string, len(codes))
+	copy(sortedCodes, codes)
+	sort.Strings(sortedCodes)
+	cacheKey := strings.Join(sortedCodes, ",")
 
 	// 检查缓存
 	ms.cacheMu.RLock()
@@ -148,8 +207,7 @@ func (ms *MarketService) fetchStockDataWithOrderBook(codes ...string) ([]StockWi
 // parseSinaStockDataWithOrderBook 解析新浪股票数据（含盘口）
 func (ms *MarketService) parseSinaStockDataWithOrderBook(data string) ([]StockWithOrderBook, error) {
 	var stocks []StockWithOrderBook
-	re := regexp.MustCompile(`var hq_str_(\w+)="([^"]*)"`)
-	matches := re.FindAllStringSubmatch(data, -1)
+	matches := sinaStockRegex.FindAllStringSubmatch(data, -1)
 
 	for _, match := range matches {
 		if len(match) < 3 || match[2] == "" {
@@ -198,8 +256,7 @@ func (ms *MarketService) GetStockRealTimeData(codes ...string) ([]models.Stock, 
 // parseSinaStockData 解析新浪股票数据
 func (ms *MarketService) parseSinaStockData(data string, codes []string) ([]models.Stock, error) {
 	var stocks []models.Stock
-	re := regexp.MustCompile(`var hq_str_(\w+)="([^"]*)"`)
-	matches := re.FindAllStringSubmatch(data, -1)
+	matches := sinaStockRegex.FindAllStringSubmatch(data, -1)
 
 	for _, match := range matches {
 		if len(match) < 3 || match[2] == "" {
@@ -326,8 +383,39 @@ func (ms *MarketService) calculateOrderBookTotals(items []models.OrderBookItem) 
 	}
 }
 
-// GetKLineData 获取K线数据
+// GetKLineData 获取K线数据（带缓存）
 func (ms *MarketService) GetKLineData(code string, period string, days int) ([]models.KLineData, error) {
+	cacheKey := fmt.Sprintf("%s:%s:%d", code, period, days)
+
+	// 检查缓存
+	ms.klineCacheMu.RLock()
+	if cached, ok := ms.klineCache[cacheKey]; ok {
+		if time.Since(cached.timestamp) < ms.klineCacheTTL {
+			ms.klineCacheMu.RUnlock()
+			return cached.data, nil
+		}
+	}
+	ms.klineCacheMu.RUnlock()
+
+	// 从API获取数据
+	klines, err := ms.fetchKLineData(code, period, days)
+	if err != nil {
+		return nil, err
+	}
+
+	// 更新缓存
+	ms.klineCacheMu.Lock()
+	ms.klineCache[cacheKey] = &klineCache{
+		data:      klines,
+		timestamp: time.Now(),
+	}
+	ms.klineCacheMu.Unlock()
+
+	return klines, nil
+}
+
+// fetchKLineData 从API获取K线数据
+func (ms *MarketService) fetchKLineData(code string, period string, days int) ([]models.KLineData, error) {
 	scale := ms.periodToScale(period)
 	url := fmt.Sprintf(sinaKLineURL, code, scale, days)
 
@@ -657,8 +745,7 @@ func (ms *MarketService) GetMarketIndices() ([]models.MarketIndex, error) {
 // 字段: 名称,当前点位,涨跌点数,涨跌幅(%),成交量(手),成交额(万元)
 func (ms *MarketService) parseMarketIndices(data string) ([]models.MarketIndex, error) {
 	var indices []models.MarketIndex
-	re := regexp.MustCompile(`var hq_str_s_(\w+)="([^"]*)"`)
-	matches := re.FindAllStringSubmatch(data, -1)
+	matches := sinaIndexRegex.FindAllStringSubmatch(data, -1)
 
 	for _, match := range matches {
 		if len(match) < 3 || match[2] == "" {

@@ -61,6 +61,10 @@ type MarketDataPusher struct {
 	// 快讯缓存（用于检测新快讯）
 	lastTelegraphContent string
 
+	// 市场状态缓存（用于降频判断）
+	lastMarketStatus     string
+	lastMarketStatusTime time.Time
+
 	// 控制
 	stopChan chan struct{}
 	running  bool
@@ -168,29 +172,17 @@ func (p *MarketDataPusher) updateSubscriptions(codes []any) {
 	}
 }
 
-// pushLoop 数据推送循环
+// pushLoop 数据推送循环（优化版：合并Ticker + 非交易时段降频30秒+缓存）
 func (p *MarketDataPusher) pushLoop() {
-	// 股票数据推送间隔：3秒
-	stockTicker := time.NewTicker(3 * time.Second)
-	// 盘口数据推送间隔：1秒
-	orderBookTicker := time.NewTicker(1 * time.Second)
-	// 快讯数据推送间隔：30秒
-	telegraphTicker := time.NewTicker(30 * time.Second)
-	// 市场状态推送间隔：60秒
-	marketStatusTicker := time.NewTicker(5 * time.Second)
-	// 大盘指数推送间隔：3秒
-	marketIndicesTicker := time.NewTicker(3 * time.Second)
-	// 分时K线推送间隔：3秒
-	klineMinuteTicker := time.NewTicker(3 * time.Second)
-	// 日/周/月K线推送间隔：5分钟
-	klineDayTicker := time.NewTicker(5 * time.Minute)
+	// 合并相同间隔的Ticker，减少调度开销
+	fastTicker := time.NewTicker(1 * time.Second)       // 盘口数据（高频）
+	normalTicker := time.NewTicker(3 * time.Second)    // 股票、指数、分时K线
+	slowTicker := time.NewTicker(30 * time.Second)     // 快讯
+	klineDayTicker := time.NewTicker(5 * time.Minute)  // 日/周/月K线
 
-	defer stockTicker.Stop()
-	defer orderBookTicker.Stop()
-	defer telegraphTicker.Stop()
-	defer marketStatusTicker.Stop()
-	defer marketIndicesTicker.Stop()
-	defer klineMinuteTicker.Stop()
+	defer fastTicker.Stop()
+	defer normalTicker.Stop()
+	defer slowTicker.Stop()
 	defer klineDayTicker.Stop()
 
 	// 立即推送一次
@@ -201,26 +193,74 @@ func (p *MarketDataPusher) pushLoop() {
 	safeCall(p.pushMarketIndices)
 	safeCall(p.pushKLineData)
 
+	var normalCount int
+
 	for {
 		select {
 		case <-p.stopChan:
 			return
-		case <-stockTicker.C:
-			safeCall(p.pushStockData)
-		case <-orderBookTicker.C:
+		case <-fastTicker.C:
+			// 非交易时段跳过盘口高频推送
+			if p.isMarketClosed() {
+				continue
+			}
 			safeCall(p.pushOrderBookData)
-		case <-telegraphTicker.C:
-			safeCall(p.pushTelegraphData)
-		case <-marketStatusTicker.C:
-			safeCall(p.pushMarketStatus)
-		case <-marketIndicesTicker.C:
+		case <-normalTicker.C:
+			normalCount++
+
+			// 非交易时段：降频为30秒一次（normalCount%10）
+			if p.isMarketClosed() {
+				if normalCount%10 == 0 {
+					// 30秒推送一次，数据会走缓存
+					safeCall(p.pushStockData)
+					safeCall(p.pushMarketIndices)
+					safeCall(p.pushOrderBookData)
+					safeCall(p.pushKLineData)
+					safeCall(p.pushMarketStatus)
+				}
+				continue
+			}
+
+			// 交易时段正常推送
+			safeCall(p.pushStockData)
 			safeCall(p.pushMarketIndices)
-		case <-klineMinuteTicker.C:
 			safeCall(p.pushKLineMinute)
+			// 市场状态每6秒检查一次
+			if normalCount%2 == 0 {
+				safeCall(p.pushMarketStatus)
+			}
+		case <-slowTicker.C:
+			safeCall(p.pushTelegraphData)
 		case <-klineDayTicker.C:
+			// 非交易时段跳过日K线推送
+			if p.isMarketClosed() {
+				continue
+			}
 			safeCall(p.pushKLineDay)
 		}
 	}
+}
+
+// isMarketClosed 判断市场是否处于非交易状态（用于降频）
+func (p *MarketDataPusher) isMarketClosed() bool {
+	p.mu.RLock()
+	status := p.lastMarketStatus
+	statusTime := p.lastMarketStatusTime
+	p.mu.RUnlock()
+
+	// 缓存有效期10秒，避免频繁调用GetMarketStatus
+	if time.Since(statusTime) < 10*time.Second && status != "" {
+		return status == "closed"
+	}
+
+	// 更新缓存
+	marketStatus := p.marketService.GetMarketStatus()
+	p.mu.Lock()
+	p.lastMarketStatus = marketStatus.Status
+	p.lastMarketStatusTime = time.Now()
+	p.mu.Unlock()
+
+	return marketStatus.Status == "closed"
 }
 
 // pushStockData 推送股票实时数据

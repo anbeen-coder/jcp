@@ -50,7 +50,9 @@ export const AgentRoom: React.FC<AgentRoomProps> = ({ session, onSessionUpdate }
 
   // 跟踪当前活跃的 stockCode
   const currentStockCodeRef = useRef<string | null>(null);
-  currentStockCodeRef.current = session?.stockCode || null;
+
+  // 跟踪上一次的 stockCode（用于检测切换）
+  const prevStockCodeRef = useRef<string | null>(null);
 
   // 会议取消标识
   const meetingCancelledRef = useRef<Record<string, boolean>>({});
@@ -133,24 +135,29 @@ export const AgentRoom: React.FC<AgentRoomProps> = ({ session, onSessionUpdate }
 
   // 当Session变化时，从后端加载最新消息
   useEffect(() => {
-    // 记录之前的 stockCode 用于取消
-    const prevStockCode = currentStockCodeRef.current;
+    // 使用 prevStockCodeRef 获取真正的上一次 stockCode
+    const prevStockCode = prevStockCodeRef.current;
+    const newStockCode = session?.stockCode || null;
 
-    if (session?.stockCode) {
+    if (newStockCode) {
       // 如果切换到新股票，取消之前股票的会议
-      if (prevStockCode && prevStockCode !== session.stockCode && simulatingMap[prevStockCode]) {
+      if (prevStockCode && prevStockCode !== newStockCode && simulatingMap[prevStockCode]) {
         cancelMeeting(prevStockCode);
         showToast('已切换股票，之前的会议已取消', 'info');
       }
 
       // 从后端获取最新消息（包括切换期间产生的新消息）
-      getSessionMessages(session.stockCode).then(msgs => {
+      getSessionMessages(newStockCode).then(msgs => {
         setMessages(msgs || []);
       });
     } else {
       setMessages([]);
     }
     setUserQuery('');
+
+    // 更新 refs（在 effect 结束时更新，确保下次能正确检测切换）
+    prevStockCodeRef.current = newStockCode;
+    currentStockCodeRef.current = newStockCode;
   }, [session?.stockCode]);
 
   // 订阅会议消息事件（实时接收发言）

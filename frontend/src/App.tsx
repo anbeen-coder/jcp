@@ -232,6 +232,8 @@ const App: React.FC = () => {
       setWatchlist(prev => [...prev, newStock]);
       // 添加后自动选中新股票并加载数据
       setSelectedSymbol(newStock.symbol);
+      // 先清空 session，避免显示旧股票的消息
+      setCurrentSession(null);
       subscribeOrderBook(newStock.symbol);
       // 加载 Session 和盘口数据
       const [session, orderBookData] = await Promise.all([
