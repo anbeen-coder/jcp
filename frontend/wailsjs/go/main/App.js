@@ -138,12 +138,24 @@ export function GetTelegraphList() {
   return window['go']['main']['App']['GetTelegraphList']();
 }
 
+export function GetTradeDates(arg1) {
+  return window['go']['main']['App']['GetTradeDates'](arg1);
+}
+
+export function GetTradingSchedule() {
+  return window['go']['main']['App']['GetTradingSchedule']();
+}
+
 export function GetWatchlist() {
   return window['go']['main']['App']['GetWatchlist']();
 }
 
 export function Greet(arg1) {
   return window['go']['main']['App']['Greet'](arg1);
+}
+
+export function NotifyFrontendReady() {
+  return window['go']['main']['App']['NotifyFrontendReady']();
 }
 
 export function OpenURL(arg1) {

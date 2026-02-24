@@ -75,9 +75,15 @@ export function GetStrategies():Promise<Array<models.Strategy>>;
 
 export function GetTelegraphList():Promise<Array<services.Telegraph>>;
 
+export function GetTradeDates(arg1:number):Promise<Array<string>>;
+
+export function GetTradingSchedule():Promise<services.TradingSchedule>;
+
 export function GetWatchlist():Promise<Array<models.Stock>>;
 
 export function Greet(arg1:string):Promise<string>;
+
+export function NotifyFrontendReady():Promise<void>;
 
 export function OpenURL(arg1:string):Promise<void>;
 

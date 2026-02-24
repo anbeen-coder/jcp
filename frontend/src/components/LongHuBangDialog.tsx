@@ -1,22 +1,12 @@
 import React, { useState, useEffect } from 'react';
-import { X, TrendingUp, RefreshCw, Calendar } from 'lucide-react';
-import { GetLongHuBangList, GetLongHuBangDetail } from '../../wailsjs/go/main/App';
+import { X, TrendingUp, RefreshCw, Calendar, ChevronDown } from 'lucide-react';
+import { GetLongHuBangList, GetLongHuBangDetail, GetTradeDates } from '../../wailsjs/go/main/App';
 import { models } from '../../wailsjs/go/models';
 
 interface LongHuBangDialogProps {
   isOpen: boolean;
   onClose: () => void;
 }
-
-// 获取默认交易日期：16点前用前一天，16点后用当天
-const getDefaultTradeDate = (): string => {
-  const now = new Date();
-  const hour = now.getHours();
-  if (hour < 16) {
-    now.setDate(now.getDate() - 1);
-  }
-  return now.toISOString().split('T')[0];
-};
 
 export const LongHuBangDialog: React.FC<LongHuBangDialogProps> = ({ isOpen, onClose }) => {
   const [items, setItems] = useState<models.LongHuBangItem[]>([]);
@@ -26,6 +16,7 @@ export const LongHuBangDialog: React.FC<LongHuBangDialogProps> = ({ isOpen, onCl
   const [details, setDetails] = useState<models.LongHuBangDetail[]>([]);
   const [detailLoading, setDetailLoading] = useState(false);
   const [tradeDate, setTradeDate] = useState('');
+  const [tradeDates, setTradeDates] = useState<string[]>([]);
   const [pageNumber, setPageNumber] = useState(1);
   const [hasMore, setHasMore] = useState(true);
   const pageSize = 30;
@@ -58,11 +49,17 @@ export const LongHuBangDialog: React.FC<LongHuBangDialogProps> = ({ isOpen, onCl
 
   useEffect(() => {
     if (isOpen) {
-      const defaultDate = getDefaultTradeDate();
-      setPageNumber(1);
-      setTradeDate(defaultDate);
-      setHasMore(true);
-      loadList(1, defaultDate, false);
+      // 先获取交易日列表
+      GetTradeDates(60).then((dates) => {
+        if (dates && dates.length > 0) {
+          setTradeDates(dates);
+          const defaultDate = dates[0]; // 使用最近的交易日
+          setTradeDate(defaultDate);
+          setPageNumber(1);
+          setHasMore(true);
+          loadList(1, defaultDate, false);
+        }
+      });
       setSelectedItem(null);
       setDetails([]);
     }
@@ -94,6 +91,7 @@ export const LongHuBangDialog: React.FC<LongHuBangDialogProps> = ({ isOpen, onCl
           onRefresh={() => loadList(1, tradeDate, false)}
           loading={loading}
           tradeDate={tradeDate}
+          tradeDates={tradeDates}
           onDateChange={handleDateChange}
         />
         <div className="flex-1 flex overflow-hidden">
@@ -119,38 +117,112 @@ export const LongHuBangDialog: React.FC<LongHuBangDialogProps> = ({ isOpen, onCl
   );
 };
 
+// 日期选择下拉框组件
+const DatePicker: React.FC<{
+  value: string;
+  options: string[];
+  onChange: (date: string) => void;
+}> = ({ value, options, onChange }) => {
+  const [isOpen, setIsOpen] = useState(false);
+  const containerRef = React.useRef<HTMLDivElement>(null);
+
+  // 点击外部关闭
+  useEffect(() => {
+    const handleClickOutside = (e: MouseEvent) => {
+      if (containerRef.current && !containerRef.current.contains(e.target as Node)) {
+        setIsOpen(false);
+      }
+    };
+    if (isOpen) {
+      document.addEventListener('mousedown', handleClickOutside);
+    }
+    return () => document.removeEventListener('mousedown', handleClickOutside);
+  }, [isOpen]);
+
+  // 格式化日期显示 (2026-02-24 -> 02月24日 周二)
+  const formatDateDisplay = (dateStr: string) => {
+    const date = new Date(dateStr);
+    const weekDays = ['周日', '周一', '周二', '周三', '周四', '周五', '周六'];
+    const month = String(date.getMonth() + 1).padStart(2, '0');
+    const day = String(date.getDate()).padStart(2, '0');
+    return `${month}月${day}日 ${weekDays[date.getDay()]}`;
+  };
+
+  return (
+    <div ref={containerRef} className="relative">
+      <button
+        onClick={() => setIsOpen(!isOpen)}
+        className="flex items-center gap-2 px-3 py-1.5 rounded-lg fin-panel border fin-divider hover:border-accent/50 transition-colors"
+      >
+        <Calendar className="w-4 h-4 text-accent" />
+        <span className="text-sm fin-text-primary font-medium">
+          {formatDateDisplay(value)}
+        </span>
+        <ChevronDown className={`w-4 h-4 fin-text-tertiary transition-transform ${isOpen ? 'rotate-180' : ''}`} />
+      </button>
+
+      {isOpen && (
+        <div className="absolute right-0 top-full mt-2 w-56 max-h-80 overflow-y-auto fin-panel border fin-divider rounded-xl shadow-xl z-50 fin-scrollbar">
+          <div className="p-2">
+            {options.map((date, idx) => {
+              const isSelected = date === value;
+              const isToday = idx === 0;
+              return (
+                <button
+                  key={date}
+                  onClick={() => {
+                    onChange(date);
+                    setIsOpen(false);
+                  }}
+                  className={`w-full flex items-center justify-between px-3 py-2 rounded-lg text-sm transition-colors ${
+                    isSelected
+                      ? 'bg-accent/15 text-accent'
+                      : 'fin-text-primary hover:bg-slate-500/10'
+                  }`}
+                >
+                  <div className="flex items-center gap-2">
+                    <span className={isSelected ? 'font-medium' : ''}>
+                      {formatDateDisplay(date)}
+                    </span>
+                    {isToday && (
+                      <span className="text-[10px] px-1.5 py-0.5 rounded bg-accent/20 text-accent">
+                        最新
+                      </span>
+                    )}
+                  </div>
+                  {isSelected && (
+                    <div className="w-1.5 h-1.5 rounded-full bg-accent" />
+                  )}
+                </button>
+              );
+            })}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+};
+
 // 头部组件
 const DialogHeader: React.FC<{
   onClose: () => void;
   onRefresh: () => void;
   loading: boolean;
   tradeDate: string;
+  tradeDates: string[];
   onDateChange: (date: string) => void;
-}> = ({ onClose, onRefresh, loading, tradeDate, onDateChange }) => (
+}> = ({ onClose, onRefresh, loading, tradeDate, tradeDates, onDateChange }) => (
   <div className="flex items-center justify-between px-5 py-4 border-b fin-divider">
     <div className="flex items-center gap-3">
       <TrendingUp className="w-5 h-5 text-red-500" />
       <h2 className="text-lg font-semibold fin-text-primary">龙虎榜</h2>
     </div>
     <div className="flex items-center gap-3">
-      <div className="flex items-center gap-2">
-        <Calendar className="w-4 h-4 fin-text-tertiary" />
-        <input
-          type="date"
-          value={tradeDate}
-          onChange={(e) => onDateChange(e.target.value)}
-          className="px-2 py-1 text-sm rounded-lg fin-panel border fin-divider fin-text-primary bg-transparent focus:outline-none focus:ring-1 focus:ring-accent"
-          max={new Date().toISOString().split('T')[0]}
-        />
-        {tradeDate && (
-          <button
-            onClick={() => onDateChange('')}
-            className="text-xs fin-text-tertiary hover:fin-text-secondary"
-          >
-            清除
-          </button>
-        )}
-      </div>
+      <DatePicker
+        value={tradeDate}
+        options={tradeDates}
+        onChange={onDateChange}
+      />
       <button
         onClick={onRefresh}
         disabled={loading}
@@ -227,7 +299,7 @@ const ItemList: React.FC<{
           className={`px-4 py-3 border-b fin-divider cursor-pointer transition-all ${
             selectedItem?.code === item.code && selectedItem?.tradeDate === item.tradeDate
               ? 'bg-accent/10 border-l-2 border-l-accent'
-              : 'hover:bg-slate-500/5 border-l-2 border-l-transparent'
+              : 'fin-list-hover border-l-2 border-l-transparent'
           }`}
         >
           <div className="flex items-center justify-between mb-1.5">

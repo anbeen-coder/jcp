@@ -881,6 +881,58 @@ export namespace services {
 	        this.url = source["url"];
 	    }
 	}
+	export class TradingPeriod {
+	    status: string;
+	    text: string;
+	    startTime: string;
+	    endTime: string;
+	
+	    static createFrom(source: any = {}) {
+	        return new TradingPeriod(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.status = source["status"];
+	        this.text = source["text"];
+	        this.startTime = source["startTime"];
+	        this.endTime = source["endTime"];
+	    }
+	}
+	export class TradingSchedule {
+	    isTradeDay: boolean;
+	    holidayName: string;
+	    periods: TradingPeriod[];
+	
+	    static createFrom(source: any = {}) {
+	        return new TradingSchedule(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.isTradeDay = source["isTradeDay"];
+	        this.holidayName = source["holidayName"];
+	        this.periods = this.convertValues(source["periods"], TradingPeriod);
+	    }
+	
+		convertValues(a: any, classs: any, asMap: boolean = false): any {
+		    if (!a) {
+		        return a;
+		    }
+		    if (a.slice && a.map) {
+		        return (a as any[]).map(elem => this.convertValues(elem, classs));
+		    } else if ("object" === typeof a) {
+		        if (asMap) {
+		            for (const key of Object.keys(a)) {
+		                a[key] = new classs(a[key]);
+		            }
+		            return a;
+		        }
+		        return new classs(a);
+		    }
+		    return a;
+		}
+	}
 	export class UpdateInfo {
 	    hasUpdate: boolean;
 	    latestVersion: string;

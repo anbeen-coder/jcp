@@ -58,7 +58,7 @@ export const StockChart: React.FC<StockChartProps> = ({ data, period, onPeriodCh
   const isIntraday = period === '1m';
   const preClose = stock?.preClose || 0;
 
-  // 计算分时图的价格域（以昨收为中心对称）
+  // 计算分时图的价格域（以昨收为中心对称，动态自适应波动幅度）
   const intradayDomain = useMemo(() => {
     if (!isIntraday || safeData.length === 0 || preClose <= 0) return { min: 0, max: 0, range: 0 };
 
@@ -66,12 +66,35 @@ export const StockChart: React.FC<StockChartProps> = ({ data, period, onPeriodCh
     const maxPrice = Math.max(...prices);
     const minPrice = Math.min(...prices);
 
-    // 计算相对昨收的最大偏离
+    // 计算相对昨收的最大偏离幅度（百分比）
     const maxDiff = Math.max(Math.abs(maxPrice - preClose), Math.abs(minPrice - preClose));
-    // 增加10%的边距
-    const range = maxDiff * 1.1;
-    // 确保至少有0.5%的范围
-    const minRange = preClose * 0.005;
+    const diffPercent = (maxDiff / preClose) * 100;
+
+    // 分档边距策略：波动越小，边距比例越小，图表越紧凑
+    // 这样小波动也能撑满图表空间，营造紧张感
+    let marginRatio: number;
+    let minRangePercent: number;
+
+    if (diffPercent < 0.3) {
+      // 极窄幅震荡（<0.3%）：极紧凑，微波动放大
+      marginRatio = 0.15;
+      minRangePercent = 0.08;
+    } else if (diffPercent < 1.0) {
+      // 小幅波动（0.3%-1%）：紧凑布局
+      marginRatio = 0.12;
+      minRangePercent = 0.06;
+    } else if (diffPercent < 3.0) {
+      // 中等波动（1%-3%）：适度留白
+      marginRatio = 0.08;
+      minRangePercent = 0.05;
+    } else {
+      // 大幅波动（>3%）：标准留白
+      marginRatio = 0.06;
+      minRangePercent = 0.05;
+    }
+
+    const range = maxDiff * (1 + marginRatio);
+    const minRange = preClose * (minRangePercent / 100);
     const finalRange = Math.max(range, minRange);
 
     return {
@@ -79,6 +102,20 @@ export const StockChart: React.FC<StockChartProps> = ({ data, period, onPeriodCh
       max: preClose + finalRange,
       range: finalRange
     };
+  }, [isIntraday, safeData, preClose]);
+
+  // 根据波动幅度动态计算价格线宽度：波动越小线越粗，视觉张力更强
+  const priceLineWidth = useMemo(() => {
+    if (!isIntraday || preClose <= 0 || safeData.length === 0) return 1.5;
+    const prices = safeData.map(d => d.close);
+    const maxP = Math.max(...prices);
+    const minP = Math.min(...prices);
+    const diffPercent = ((maxP - minP) / preClose) * 100;
+
+    if (diffPercent < 0.2) return 2.5;      // 极窄幅：粗线强化波动感
+    if (diffPercent < 0.5) return 2.0;
+    if (diffPercent < 1.5) return 1.5;
+    return 1.2;                              // 大波动：细线避免视觉拥挤
   }, [isIntraday, safeData, preClose]);
 
   // 格式化涨跌幅
@@ -321,12 +358,14 @@ export const StockChart: React.FC<StockChartProps> = ({ data, period, onPeriodCh
             >
               <defs>
                 <linearGradient id="priceGradientUp" x1="0" y1="0" x2="0" y2="1">
-                  <stop offset="0%" stopColor="#ef4444" stopOpacity={0.3} />
-                  <stop offset="100%" stopColor="#ef4444" stopOpacity={0.05} />
+                  <stop offset="0%" stopColor="#ef4444" stopOpacity={0.35} />
+                  <stop offset="40%" stopColor="#ef4444" stopOpacity={0.15} />
+                  <stop offset="100%" stopColor="#ef4444" stopOpacity={0.02} />
                 </linearGradient>
                 <linearGradient id="priceGradientDown" x1="0" y1="1" x2="0" y2="0">
-                  <stop offset="0%" stopColor="#22c55e" stopOpacity={0.3} />
-                  <stop offset="100%" stopColor="#22c55e" stopOpacity={0.05} />
+                  <stop offset="0%" stopColor="#22c55e" stopOpacity={0.35} />
+                  <stop offset="40%" stopColor="#22c55e" stopOpacity={0.15} />
+                  <stop offset="100%" stopColor="#22c55e" stopOpacity={0.02} />
                 </linearGradient>
               </defs>
 
@@ -406,7 +445,7 @@ export const StockChart: React.FC<StockChartProps> = ({ data, period, onPeriodCh
               {/* 价格区域填充 */}
               <Area
                 yAxisId="price"
-                type="linear"
+                type="monotone"
                 dataKey="close"
                 stroke="none"
                 fill={currentPrice >= preClose ? "url(#priceGradientUp)" : "url(#priceGradientDown)"}
@@ -417,10 +456,10 @@ export const StockChart: React.FC<StockChartProps> = ({ data, period, onPeriodCh
               {/* 价格线 */}
               <Line
                 yAxisId="price"
-                type="linear"
+                type="monotone"
                 dataKey="close"
                 stroke="#38bdf8"
-                strokeWidth={1.5}
+                strokeWidth={priceLineWidth}
                 dot={false}
                 isAnimationActive={false}
                 name="价格"
@@ -429,7 +468,7 @@ export const StockChart: React.FC<StockChartProps> = ({ data, period, onPeriodCh
               {/* 均价线 */}
               <Line
                 yAxisId="price"
-                type="linear"
+                type="monotone"
                 dataKey="avg"
                 stroke="#facc15"
                 strokeWidth={1}
@@ -566,23 +605,26 @@ export const StockChart: React.FC<StockChartProps> = ({ data, period, onPeriodCh
               }}
             />
             <Bar dataKey="volume" yAxisId="right" isAnimationActive={false}>
-              {chartData.map((entry, index) => {
-                // 分时图：价格高于均价为红，低于均价为绿
-                // K线图：收盘高于开盘为红，低于开盘为绿
-                let isUp: boolean;
-                if (isIntraday) {
-                  isUp = entry.close >= (entry.avg || entry.close);
-                } else {
-                  isUp = entry.close >= entry.open;
-                }
-                return (
-                  <Cell
-                    key={`vol-${index}`}
-                    fill={isUp ? '#ef4444' : '#22c55e'}
-                    opacity={0.6}
-                  />
-                );
-              })}
+              {(() => {
+                const avgVol = chartData.reduce((s, d) => s + d.volume, 0) / (chartData.length || 1);
+                return chartData.map((entry, index) => {
+                  // 分时图：价格高于均价为红，低于均价为绿
+                  // K线图：收盘高于开盘为红，低于开盘为绿
+                  const isUp = isIntraday
+                    ? entry.close >= (entry.avg || entry.close)
+                    : entry.close >= entry.open;
+                  // 动态透明度：放量时更醒目，缩量时更淡
+                  const volRatio = avgVol > 0 ? entry.volume / avgVol : 1;
+                  const opacity = Math.min(0.95, Math.max(0.3, 0.4 + volRatio * 0.25));
+                  return (
+                    <Cell
+                      key={`vol-${index}`}
+                      fill={isUp ? '#ef4444' : '#22c55e'}
+                      opacity={opacity}
+                    />
+                  );
+                });
+              })()}
             </Bar>
           </ComposedChart>
         </ResponsiveContainer>

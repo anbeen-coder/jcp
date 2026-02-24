@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"os"
 	"path/filepath"
 	"sync"
 
@@ -15,6 +14,7 @@ import (
 	"github.com/run-bigpig/jcp/internal/memory"
 	"github.com/run-bigpig/jcp/internal/models"
 	"github.com/run-bigpig/jcp/internal/openclaw"
+	"github.com/run-bigpig/jcp/internal/pkg/paths"
 	"github.com/run-bigpig/jcp/internal/pkg/proxy"
 	"github.com/run-bigpig/jcp/internal/services"
 	"github.com/run-bigpig/jcp/internal/services/hottrend"
@@ -50,7 +50,7 @@ type App struct {
 
 // NewApp creates a new App application struct
 func NewApp() *App {
-	dataDir := getDataDir()
+	dataDir := paths.GetDataDir()
 
 	// 初始化文件日志
 	if err := logger.InitFileLogger(filepath.Join(dataDir, "logs")); err != nil {
@@ -172,14 +172,6 @@ func NewApp() *App {
 		openClawServer:     openClawServer,
 		meetingCancels:     make(map[string]context.CancelFunc),
 	}
-}
-
-func getDataDir() string {
-	userConfigDir, err := os.UserConfigDir()
-	if err != nil || userConfigDir == "" {
-		return filepath.Join(".", "data")
-	}
-	return filepath.Join(userConfigDir, "jcp")
 }
 
 // startup is called when the app starts. The context is saved
@@ -1087,6 +1079,27 @@ func (a *App) GetCurrentVersion() string {
 	return a.updateService.GetCurrentVersion()
 }
 
+// GetTradeDates 获取交易日列表
+func (a *App) GetTradeDates(days int) []string {
+	if a.marketService == nil {
+		return nil
+	}
+	dates, err := a.marketService.GetTradeDates(days)
+	if err != nil {
+		return nil
+	}
+	return dates
+}
+
+// GetTradingSchedule 获取交易时间表
+func (a *App) GetTradingSchedule() *services.TradingSchedule {
+	if a.marketService == nil {
+		return nil
+	}
+	schedule := a.marketService.GetTradingSchedule()
+	return &schedule
+}
+
 // GetLongHuBangList 获取龙虎榜列表
 func (a *App) GetLongHuBangList(pageSize, pageNumber int, tradeDate string) *services.LongHuBangListResult {
 	if a.longHuBangService == nil {
@@ -1111,4 +1124,11 @@ func (a *App) GetLongHuBangDetail(code, tradeDate string) []models.LongHuBangDet
 		return nil
 	}
 	return details
+}
+
+// NotifyFrontendReady 前端通知已准备好，开始推送数据
+func (a *App) NotifyFrontendReady() {
+	if a.marketPusher != nil {
+		a.marketPusher.SetReady()
+	}
 }

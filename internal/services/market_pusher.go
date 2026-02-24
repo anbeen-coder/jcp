@@ -20,7 +20,6 @@ const (
 	EventStockUpdate         = "market:stock:update"
 	EventOrderBookUpdate     = "market:orderbook:update"
 	EventTelegraphUpdate     = "market:telegraph:update"
-	EventMarketStatusUpdate  = "market:status:update"
 	EventMarketIndicesUpdate = "market:indices:update"
 	EventMarketSubscribe     = "market:subscribe"
 	EventOrderBookSubscribe  = "market:orderbook:subscribe"
@@ -75,15 +74,12 @@ type MarketDataPusher struct {
 	// 盘口缓存（用于diff检测）
 	lastOrderBookHash string
 
-	// 市场状态缓存
-	lastMarketStatus     string    // 用于 getMarketPhase 降频
-	lastMarketStatusTime time.Time
-	lastPushedStatus     string    // 用于 pushMarketStatus 去重
-
 	// 控制
-	stopChan chan struct{}
-	stopped  bool
-	ctrlMu   sync.Mutex
+	stopChan  chan struct{}
+	stopped   bool
+	ctrlMu    sync.Mutex
+	ready     bool        // 前端是否已准备好
+	readyChan chan struct{} // 前端准备好信号
 }
 
 // NewMarketDataPusher 创建市场数据推送服务
@@ -94,6 +90,7 @@ func NewMarketDataPusher(marketService *MarketService, configService *ConfigServ
 		newsService:     newsService,
 		subscribedCodes: make([]string, 0),
 		stopChan:        make(chan struct{}),
+		readyChan:       make(chan struct{}),
 	}
 }
 
@@ -110,6 +107,18 @@ func (p *MarketDataPusher) Start(ctx context.Context) {
 	p.setupEventListeners()
 	p.initSubscriptions()
 	go p.pushLoop()
+}
+
+// SetReady 设置前端已准备好，开始推送数据
+func (p *MarketDataPusher) SetReady() {
+	p.ctrlMu.Lock()
+	defer p.ctrlMu.Unlock()
+	if p.ready {
+		return
+	}
+	p.ready = true
+	close(p.readyChan)
+	pusherLog.Info("前端已就绪，开始推送数据")
 }
 
 // Stop 停止推送服务
@@ -197,6 +206,14 @@ func (p *MarketDataPusher) updateSubscriptions(codes []any) {
 
 // pushLoop 数据推送循环（并行推送 + 超时控制 + 时段感知）
 func (p *MarketDataPusher) pushLoop() {
+	// 等待前端准备好
+	select {
+	case <-p.readyChan:
+		pusherLog.Info("收到前端就绪信号，启动推送循环")
+	case <-p.stopChan:
+		return
+	}
+
 	fastTicker := time.NewTicker(tickerFast)
 	normalTicker := time.NewTicker(tickerNormal)
 	slowTicker := time.NewTicker(tickerSlow)
@@ -207,12 +224,9 @@ func (p *MarketDataPusher) pushLoop() {
 	defer slowTicker.Stop()
 	defer klineDayTicker.Stop()
 
-	// 延迟500ms等待前端事件监听注册完成
-	time.Sleep(500 * time.Millisecond)
-
 	// 立即并行推送一次
 	p.runParallel(2*time.Second, p.pushStockData, p.pushOrderBookData,
-		p.pushTelegraphData, p.pushMarketStatus, p.pushMarketIndices, p.pushKLineData)
+		p.pushTelegraphData, p.pushMarketIndices, p.pushKLineData)
 
 	var normalCount int
 
@@ -233,12 +247,7 @@ func (p *MarketDataPusher) pushLoop() {
 			switch status {
 			case "trading":
 				// 交易时段：正常频率
-				if normalCount%2 == 0 {
-					p.runParallel(2*time.Second, p.pushStockData, p.pushMarketIndices,
-						p.pushKLineMinute, p.pushMarketStatus)
-				} else {
-					p.runParallel(2*time.Second, p.pushStockData, p.pushMarketIndices, p.pushKLineMinute)
-				}
+				p.runParallel(2*time.Second, p.pushStockData, p.pushMarketIndices, p.pushKLineMinute)
 			case "pre_market":
 				// 集合竞价：推送盘口（虚拟撮合价）和股票，降频
 				if normalCount%3 == 0 {
@@ -247,13 +256,13 @@ func (p *MarketDataPusher) pushLoop() {
 			case "lunch_break":
 				// 午休：低频推送
 				if normalCount%5 == 0 {
-					p.runParallel(2*time.Second, p.pushStockData, p.pushMarketIndices, p.pushMarketStatus)
+					p.runParallel(2*time.Second, p.pushStockData, p.pushMarketIndices)
 				}
 			default:
 				// 收盘：30秒一次
 				if normalCount%10 == 0 {
 					p.runParallel(2*time.Second, p.pushStockData, p.pushMarketIndices,
-						p.pushOrderBookData, p.pushKLineData, p.pushMarketStatus)
+						p.pushOrderBookData, p.pushKLineData)
 				}
 			}
 		case <-slowTicker.C:
@@ -289,25 +298,9 @@ func (p *MarketDataPusher) runParallel(timeout time.Duration, fns ...func()) {
 	}
 }
 
-// getMarketPhase 获取市场时段（带缓存）
+// getMarketPhase 获取市场时段
 func (p *MarketDataPusher) getMarketPhase() string {
-	p.mu.RLock()
-	status := p.lastMarketStatus
-	statusTime := p.lastMarketStatusTime
-	p.mu.RUnlock()
-
-	// 缓存有效期10秒
-	if time.Since(statusTime) < 10*time.Second && status != "" {
-		return status
-	}
-
-	marketStatus := p.marketService.GetMarketStatus()
-	p.mu.Lock()
-	p.lastMarketStatus = marketStatus.Status
-	p.lastMarketStatusTime = time.Now()
-	p.mu.Unlock()
-
-	return marketStatus.Status
+	return p.marketService.GetMarketStatus().Status
 }
 
 // pushStockData 推送股票实时数据
@@ -384,21 +377,6 @@ func (p *MarketDataPusher) pushTelegraphData() {
 
 	// 推送到前端
 	runtime.EventsEmit(p.ctx, EventTelegraphUpdate, latest)
-}
-
-// pushMarketStatus 推送市场状态（仅状态变化时推送）
-func (p *MarketDataPusher) pushMarketStatus() {
-	status := p.marketService.GetMarketStatus()
-
-	p.mu.Lock()
-	if p.lastPushedStatus == status.Status {
-		p.mu.Unlock()
-		return
-	}
-	p.lastPushedStatus = status.Status
-	p.mu.Unlock()
-
-	runtime.EventsEmit(p.ctx, EventMarketStatusUpdate, status)
 }
 
 // pushMarketIndices 推送大盘指数

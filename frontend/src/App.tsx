@@ -16,7 +16,8 @@ import { getKLineData, getOrderBook } from './services/stockService';
 import { getOrCreateSession, StockSession, updateStockPosition } from './services/sessionService';
 import { getConfig, updateConfig } from './services/configService';
 import { useMarketEvents } from './hooks/useMarketEvents';
-import { Stock, KLineData, OrderBook, TimePeriod, Telegraph, MarketIndex, MarketStatus } from './types';
+import { useMarketStatus } from './hooks/useMarketStatus';
+import { Stock, KLineData, OrderBook, TimePeriod, Telegraph, MarketIndex } from './types';
 import { Radio, Settings, List, Minus, Square, X, Copy, Briefcase, TrendingUp, BarChart3 } from 'lucide-react';
 import logo from './assets/images/logo.png';
 import { GetTelegraphList, OpenURL, WindowMinimize, WindowMaximize, WindowClose } from '../wailsjs/go/main/App';
@@ -56,9 +57,11 @@ const App: React.FC = () => {
   const [showPosition, setShowPosition] = useState(false);
   const [showHotTrend, setShowHotTrend] = useState(false);
   const [showLongHuBang, setShowLongHuBang] = useState(false);
-  const [marketStatus, setMarketStatus] = useState<MarketStatus | null>(null);
   const [marketIndices, setMarketIndices] = useState<MarketIndex[]>([]);
   const [isMaximized, setIsMaximized] = useState(false);
+
+  // 使用纯前端市场状态判断
+  const { status: marketStatus } = useMarketStatus();
 
   // 布局状态
   const [leftPanelWidth, setLeftPanelWidth] = useState(LAYOUT_DEFAULTS.leftPanelWidth);
@@ -91,13 +94,6 @@ const App: React.FC = () => {
   const handleTelegraphUpdate = useCallback((data: Telegraph) => {
     if (data && data.content) {
       setMarketMessage(`[${data.time}] ${data.content}`);
-    }
-  }, []);
-
-  // 处理市场状态更新（来自后端推送）
-  const handleMarketStatusUpdate = useCallback((status: MarketStatus) => {
-    if (status) {
-      setMarketStatus(status);
     }
   }, []);
 
@@ -235,7 +231,6 @@ const App: React.FC = () => {
     onStockUpdate: handleStockUpdate,
     onOrderBookUpdate: handleOrderBookUpdate,
     onTelegraphUpdate: handleTelegraphUpdate,
-    onMarketStatusUpdate: handleMarketStatusUpdate,
     onMarketIndicesUpdate: handleMarketIndicesUpdate,
     onKLineUpdate: handleKLineUpdate,
   });
