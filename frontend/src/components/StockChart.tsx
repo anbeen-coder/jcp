@@ -43,6 +43,29 @@ const Candlestick = (props: any) => {
   );
 };
 
+// 生成完整交易时段时间轴：09:30-11:30, 13:00-15:00（1分钟间隔）
+const generateTradingTimeline = (): string[] => {
+  const times: string[] = [];
+  // 上午：09:30 - 11:30
+  for (let h = 9; h <= 11; h++) {
+    const startM = h === 9 ? 30 : 0;
+    const endM = h === 11 ? 30 : 59;
+    for (let m = startM; m <= endM; m++) {
+      times.push(`${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}`);
+    }
+  }
+  // 下午：13:00 - 15:00
+  for (let h = 13; h <= 15; h++) {
+    const endM = h === 15 ? 0 : 59;
+    for (let m = 0; m <= endM; m++) {
+      times.push(`${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}`);
+    }
+  }
+  return times;
+};
+
+const TRADING_TIMELINE = generateTradingTimeline();
+
 export const StockChart: React.FC<StockChartProps> = ({ data, period, onPeriodChange, stock }) => {
   const { colors } = useTheme();
   const safeData = data || [];
@@ -193,6 +216,34 @@ export const StockChart: React.FC<StockChartProps> = ({ data, period, onPeriodCh
     return () => document.body.classList.remove('grabbing');
   }, [isDragging]);
 
+  // 分时图：将实际数据映射到固定全天时间轴上（必须在 early return 之前调用）
+  const visibleData = isIntraday ? safeData : safeData.slice(startIndex, startIndex + visibleCount);
+
+  const chartData = useMemo(() => {
+    if (isIntraday) {
+      // 后端时间格式为 "2025-02-25 09:30:00"，提取 HH:MM 作为 key
+      const dataMap = new Map(safeData.map(d => {
+        const hm = d.time.length > 5 ? d.time.slice(11, 16) : d.time;
+        return [hm, d];
+      }));
+      return TRADING_TIMELINE.map(time => {
+        const d = dataMap.get(time);
+        if (d) {
+          return { ...d, time, range: [d.low, d.high] as [number, number], _empty: false };
+        }
+        return {
+          time, open: undefined, high: undefined, low: undefined,
+          close: undefined, avg: undefined, volume: 0,
+          range: [0, 0] as [number, number], _empty: true,
+        } as any;
+      });
+    }
+    return visibleData.map(d => ({
+      ...d,
+      range: [d.low, d.high] as [number, number],
+    }));
+  }, [isIntraday, safeData, visibleData]);
+
   if (safeData.length === 0) {
     return (
       <div className="h-full w-full fin-panel flex items-center justify-center">
@@ -201,14 +252,8 @@ export const StockChart: React.FC<StockChartProps> = ({ data, period, onPeriodCh
     );
   }
 
-  const visibleData = isIntraday ? safeData : safeData.slice(startIndex, startIndex + visibleCount);
   const lastVisible = visibleData[visibleData.length - 1];
   const displayData = hoverData || lastVisible;
-
-  const chartData = visibleData.map(d => ({
-    ...d,
-    range: [d.low, d.high] as [number, number],
-  }));
 
   // 计算当日统计数据
   const todayHigh = Math.max(...safeData.map(d => d.high));
@@ -393,14 +438,7 @@ export const StockChart: React.FC<StockChartProps> = ({ data, period, onPeriodCh
                 tick={{ fill: tickColor, fontSize: 10 }}
                 axisLine={{ stroke: axisLineColor }}
                 tickLine={false}
-                minTickGap={50}
-                interval="preserveStartEnd"
-                tickFormatter={(value) => {
-                  // 只显示整点时间
-                  if (value.endsWith(':00')) return value;
-                  if (value === '09:30' || value === '11:30' || value === '13:00' || value === '15:00') return value;
-                  return '';
-                }}
+                ticks={['09:30', '10:00', '10:30', '11:00', '11:30', '13:00', '13:30', '14:00', '14:30', '15:00']}
               />
 
               {/* 左侧价格轴 */}
@@ -445,35 +483,38 @@ export const StockChart: React.FC<StockChartProps> = ({ data, period, onPeriodCh
               {/* 价格区域填充 */}
               <Area
                 yAxisId="price"
-                type="monotone"
+                type="linear"
                 dataKey="close"
                 stroke="none"
                 fill={currentPrice >= preClose ? "url(#priceGradientUp)" : "url(#priceGradientDown)"}
                 isAnimationActive={false}
+                connectNulls
                 baseLine={preClose}
               />
 
               {/* 价格线 */}
               <Line
                 yAxisId="price"
-                type="monotone"
+                type="linear"
                 dataKey="close"
                 stroke="#38bdf8"
                 strokeWidth={priceLineWidth}
                 dot={false}
                 isAnimationActive={false}
+                connectNulls
                 name="价格"
               />
 
               {/* 均价线 */}
               <Line
                 yAxisId="price"
-                type="monotone"
+                type="linear"
                 dataKey="avg"
                 stroke="#facc15"
                 strokeWidth={1}
                 dot={false}
                 isAnimationActive={false}
+                connectNulls
                 name="均价"
               />
             </ComposedChart>
@@ -547,13 +588,7 @@ export const StockChart: React.FC<StockChartProps> = ({ data, period, onPeriodCh
                 tick={{ fill: tickColor, fontSize: 9 }}
                 axisLine={{ stroke: axisLineColor }}
                 tickLine={false}
-                minTickGap={50}
-                interval="preserveStartEnd"
-                tickFormatter={(value) => {
-                  if (value === '09:30' || value === '11:30' || value === '13:00' || value === '15:00') return value;
-                  if (value.endsWith(':00')) return value;
-                  return '';
-                }}
+                ticks={['09:30', '10:00', '10:30', '11:00', '11:30', '13:00', '13:30', '14:00', '14:30', '15:00']}
               />
             )}
             {/* 左侧占位轴，与价格图对齐 */}

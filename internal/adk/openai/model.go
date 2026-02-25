@@ -3,12 +3,19 @@ package openai
 import (
 	"context"
 	"errors"
+	"fmt"
+	"io"
 	"iter"
+	"slices"
 
 	"github.com/sashabaranov/go-openai"
 	"google.golang.org/adk/model"
 	"google.golang.org/genai"
+
+	"github.com/run-bigpig/jcp/internal/logger"
 )
+
+var modelLog = logger.New("openai:model")
 
 var _ model.LLM = &OpenAIModel{}
 
@@ -18,16 +25,18 @@ var (
 
 // OpenAIModel 实现 model.LLM 接口，支持 thinking 模型
 type OpenAIModel struct {
-	Client    *openai.Client
-	ModelName string
+	Client       *openai.Client
+	ModelName    string
+	NoSystemRole bool // 不支持 system role，需降级处理
 }
 
 // NewOpenAIModel 创建 OpenAI 模型
-func NewOpenAIModel(modelName string, cfg openai.ClientConfig) *OpenAIModel {
+func NewOpenAIModel(modelName string, cfg openai.ClientConfig, noSystemRole bool) *OpenAIModel {
 	client := openai.NewClientWithConfig(cfg)
 	return &OpenAIModel{
-		Client:    client,
-		ModelName: modelName,
+		Client:       client,
+		ModelName:    modelName,
+		NoSystemRole: noSystemRole,
 	}
 }
 
@@ -47,7 +56,7 @@ func (o *OpenAIModel) GenerateContent(ctx context.Context, req *model.LLMRequest
 // generate 非流式生成
 func (o *OpenAIModel) generate(ctx context.Context, req *model.LLMRequest) iter.Seq2[*model.LLMResponse, error] {
 	return func(yield func(*model.LLMResponse, error) bool) {
-		openaiReq, err := toOpenAIChatCompletionRequest(req, o.ModelName)
+		openaiReq, err := toOpenAIChatCompletionRequest(req, o.ModelName, o.NoSystemRole)
 		if err != nil {
 			yield(nil, err)
 			return
@@ -72,7 +81,7 @@ func (o *OpenAIModel) generate(ctx context.Context, req *model.LLMRequest) iter.
 // generateStream 流式生成
 func (o *OpenAIModel) generateStream(ctx context.Context, req *model.LLMRequest) iter.Seq2[*model.LLMResponse, error] {
 	return func(yield func(*model.LLMResponse, error) bool) {
-		openaiReq, err := toOpenAIChatCompletionRequest(req, o.ModelName)
+		openaiReq, err := toOpenAIChatCompletionRequest(req, o.ModelName, o.NoSystemRole)
 		if err != nil {
 			yield(nil, err)
 			return
@@ -102,13 +111,17 @@ func (o *OpenAIModel) processStream(stream *openai.ChatCompletionStream, yield f
 	var textContent string
 	var reasoningContent string
 
+	var streamErr error
 	for {
 		chunk, err := stream.Recv()
 		if errors.Is(err, context.Canceled) {
 			return
 		}
 		if err != nil {
-			// 流结束
+			if !errors.Is(err, io.EOF) {
+				streamErr = fmt.Errorf("流式读取错误: %w", err)
+				modelLog.Warn("流式读取中断: %v", err)
+			}
 			break
 		}
 
@@ -183,9 +196,22 @@ func (o *OpenAIModel) processStream(stream *openai.ChatCompletionStream, yield f
 		}
 	}
 
-	// 添加聚合的文本内容
+	// 添加聚合的文本内容，解析第三方特殊工具调用标记
 	if textContent != "" {
-		aggregatedContent.Parts = append(aggregatedContent.Parts, &genai.Part{Text: textContent})
+		vendorCalls, cleanedText := parseVendorToolCalls(textContent)
+		if cleanedText != "" {
+			aggregatedContent.Parts = append(aggregatedContent.Parts, &genai.Part{Text: cleanedText})
+		}
+		// 将第三方工具调用转换为 FunctionCall
+		for i, vc := range vendorCalls {
+			aggregatedContent.Parts = append(aggregatedContent.Parts, &genai.Part{
+				FunctionCall: &genai.FunctionCall{
+					ID:   fmt.Sprintf("vendor_call_%d", i),
+					Name: vc.Name,
+					Args: vc.Args,
+				},
+			})
+		}
 	}
 
 	// 添加 reasoning content 作为 thought part
@@ -209,7 +235,13 @@ func (o *OpenAIModel) processStream(stream *openai.ChatCompletionStream, yield f
 		}
 	}
 
-	// 发送最终响应
+	// 流式错误时，yield 错误让上层感知
+	if streamErr != nil {
+		yield(nil, streamErr)
+		return
+	}
+
+	// 发送最终聚合响应
 	finalResp := &model.LLMResponse{
 		Content:       aggregatedContent,
 		UsageMetadata: usageMetadata,
@@ -233,13 +265,6 @@ func sortedKeys(m map[int]*toolCallBuilder) []int {
 	for k := range m {
 		keys = append(keys, k)
 	}
-	// 简单冒泡排序
-	for i := 0; i < len(keys)-1; i++ {
-		for j := 0; j < len(keys)-i-1; j++ {
-			if keys[j] > keys[j+1] {
-				keys[j], keys[j+1] = keys[j+1], keys[j]
-			}
-		}
-	}
+	slices.Sort(keys)
 	return keys
 }

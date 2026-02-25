@@ -1,20 +1,19 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { Stock, KLineData } from '../types';
 import { getAgentConfigs, AgentConfig } from '../services/strategyService';
-import { StockSession, ChatMessage, sendMeetingMessage, MeetingMessageRequest, getSessionMessages } from '../services/sessionService';
+import { StockSession, ChatMessage, sendMeetingMessage, MeetingMessageRequest, getSessionMessages, retryAgent, retryAgentAndContinue, cancelInterruptedMeeting } from '../services/sessionService';
 import { MessageSquare, Loader2, Send, User, Users, X, Reply, Trash2, Wrench, CheckCircle2, AlertCircle, Copy, Check, RotateCcw, Pencil, Square } from 'lucide-react';
 import { clearSessionMessages } from '../services/sessionService';
 import { NodeRenderer } from 'markstream-react';
 import { EventsOn, EventsOff } from '../../wailsjs/runtime/runtime';
 import { useMentionPicker } from '../hooks/useMentionPicker';
-import { useToast } from '../hooks/useToast';
 import { useTheme } from '../contexts/ThemeContext';
 import { CancelMeeting } from '../../wailsjs/go/main/App';
 import 'markstream-react/index.css';
 
 // 进度事件类型
 interface ProgressEvent {
-  type: 'agent_start' | 'agent_done' | 'tool_call' | 'tool_result' | 'streaming';
+  type: 'agent_start' | 'agent_done' | 'tool_call' | 'tool_result' | 'streaming' | 'agent_error' | 'meeting_interrupted';
   agentId: string;
   agentName: string;
   detail?: string;
@@ -58,7 +57,6 @@ export const AgentRoom: React.FC<AgentRoomProps> = ({ session, onSessionUpdate }
   const meetingCancelledRef = useRef<Record<string, boolean>>({});
 
   // 使用自定义 Hooks
-  const { toast, showToast, hideToast } = useToast();
   const {
     mentionedAgents,
     showMentionPicker,
@@ -79,6 +77,7 @@ export const AgentRoom: React.FC<AgentRoomProps> = ({ session, onSessionUpdate }
   const [showClearConfirm, setShowClearConfirm] = useState(false);
   const [copiedId, setCopiedId] = useState<string | null>(null);
   const [failedUserMsgId, setFailedUserMsgId] = useState<string | null>(null);
+  const [retryingAgentId, setRetryingAgentId] = useState<string | null>(null);
 
   // 进度状态
   const [progress, setProgress] = useState<ProgressState>({
@@ -87,6 +86,18 @@ export const AgentRoom: React.FC<AgentRoomProps> = ({ session, onSessionUpdate }
     steps: [],
     streamingText: '',
   });
+
+  // 在聊天窗口中添加系统提示消息
+  const addSystemMessage = (text: string) => {
+    setMessages(prev => [...prev, {
+      id: `sys-${Date.now()}-${Math.random()}`,
+      agentId: 'system',
+      agentName: '',
+      role: '',
+      content: text,
+      timestamp: Date.now(),
+    }]);
+  };
 
   // 取消指定股票的会议
   const cancelMeeting = (stockCode: string) => {
@@ -103,7 +114,7 @@ export const AgentRoom: React.FC<AgentRoomProps> = ({ session, onSessionUpdate }
       steps: [],
       streamingText: '',
     });
-    showToast('讨论已停止', 'info');
+    addSystemMessage('讨论已停止');
   };
 
   // 加载Agent配置
@@ -143,7 +154,7 @@ export const AgentRoom: React.FC<AgentRoomProps> = ({ session, onSessionUpdate }
       // 如果切换到新股票，取消之前股票的会议
       if (prevStockCode && prevStockCode !== newStockCode && simulatingMap[prevStockCode]) {
         cancelMeeting(prevStockCode);
-        showToast('已切换股票，之前的会议已取消', 'info');
+        addSystemMessage('已切换股票，之前的会议已取消');
       }
 
       // 从后端获取最新消息（包括切换期间产生的新消息）
@@ -214,10 +225,17 @@ export const AgentRoom: React.FC<AgentRoomProps> = ({ session, onSessionUpdate }
             return { ...prev, steps: updatedSteps };
           case 'streaming':
             return { ...prev, streamingText: prev.streamingText + (event.content || '') };
+          case 'meeting_interrupted':
+            return prev; // 状态在外部处理
           default:
             return prev;
         }
       });
+
+      // meeting_interrupted 事件：停止会议进行状态（失败消息卡片内联按钮处理重试/放弃）
+      if (event.type === 'meeting_interrupted') {
+        setSimulatingMap(prev => ({ ...prev, [stockCode]: false }));
+      }
     });
 
     return () => {
@@ -289,7 +307,7 @@ export const AgentRoom: React.FC<AgentRoomProps> = ({ session, onSessionUpdate }
           errorMsg = '网络连接失败，请检查网络';
         }
       }
-      showToast(errorMsg, 'error');
+      addSystemMessage(errorMsg);
       // 超时或失败时记录用户消息ID，显示重试/编辑按钮
       setFailedUserMsgId(userMsg.id);
     } finally {
@@ -362,7 +380,7 @@ export const AgentRoom: React.FC<AgentRoomProps> = ({ session, onSessionUpdate }
       setCopiedId(msgId);
       setTimeout(() => setCopiedId(null), 2000);
     } catch (err) {
-      showToast('复制失败', 'error');
+      addSystemMessage('复制失败');
     }
   };
 
@@ -377,6 +395,48 @@ export const AgentRoom: React.FC<AgentRoomProps> = ({ session, onSessionUpdate }
     setUserQuery(msg.content);
     setFailedUserMsgId(null);
     inputRef.current?.focus();
+  };
+
+  // 重试失败专家（根据 meetingMode 区分行为）
+  const handleRetryAgent = async (msg: ChatMessage) => {
+    if (!session || retryingAgentId) return;
+    const stockCode = session.stockCode;
+
+    setRetryingAgentId(msg.agentId);
+    // 移除失败的消息
+    setMessages(prev => prev.filter(m => m.id !== msg.id));
+    setSimulatingMap(prev => ({ ...prev, [stockCode]: true }));
+
+    try {
+      if (msg.meetingMode === 'smart') {
+        // 串行模式：重试并继续剩余专家
+        await retryAgentAndContinue(stockCode);
+      } else {
+        // 独立模式：仅重试该专家
+        const lastUserMsg = [...messages].reverse().find(m => m.agentId === 'user');
+        const query = lastUserMsg?.content || '';
+        await retryAgent(stockCode, msg.agentId, query);
+      }
+    } catch (e) {
+      console.error('[AgentRoom] retryAgent error:', e);
+      addSystemMessage(`${msg.agentName} 重试失败`);
+    } finally {
+      setRetryingAgentId(null);
+      setSimulatingMap(prev => ({ ...prev, [stockCode]: false }));
+    }
+  };
+
+  // 放弃中断的会议（串行模式下用户放弃剩余专家）
+  const handleAbandonMeeting = async (msg: ChatMessage) => {
+    if (!session) return;
+    try {
+      await cancelInterruptedMeeting(session.stockCode);
+    } catch (e) {
+      console.error('[AgentRoom] cancelInterruptedMeeting error:', e);
+    }
+    // 移除失败消息
+    setMessages(prev => prev.filter(m => m.id !== msg.id));
+    addSystemMessage('已放弃剩余专家讨论');
   };
 
   // 显示清空确认弹窗
@@ -545,37 +605,75 @@ export const AgentRoom: React.FC<AgentRoomProps> = ({ session, onSessionUpdate }
             <div key={msg.id} className={`flex gap-3 animate-in fade-in slide-in-from-bottom-2 duration-300 group`}>
               <div
                 className="w-8 h-8 rounded-full flex items-center justify-center text-xs font-bold shrink-0 text-white shadow-md ring-2 ring-slate-900"
-                style={{ backgroundColor: agent?.color || '#475569' }}
+                style={{ backgroundColor: msg.error ? '#ef4444' : (agent?.color || '#475569') }}
               >
-                {agent?.avatar || msg.agentName?.charAt(0)}
+                {msg.error ? <AlertCircle size={14} /> : (agent?.avatar || msg.agentName?.charAt(0))}
               </div>
               <div className="flex-1 max-w-[85%]">
                 <div className="flex items-baseline gap-2 mb-1">
-                  <span className={`text-xs font-bold ${colors.isDark ? 'text-slate-300' : 'text-slate-600'}`}>{msg.agentName || agent?.name}</span>
+                  <span className={`text-xs font-bold ${msg.error ? 'text-red-400' : (colors.isDark ? 'text-slate-300' : 'text-slate-600')}`}>{msg.agentName || agent?.name}</span>
                   <span className={`text-[9px] uppercase border fin-divider px-1 rounded fin-chip ${colors.isDark ? 'text-slate-500' : 'text-slate-400'}`}>{msg.role || agent?.role}</span>
+                  {msg.error && (
+                    <span className="text-[9px] px-1 rounded bg-red-500/20 text-red-400 border border-red-500/30">失败</span>
+                  )}
                 </div>
                 <div className="relative">
-                  <div className={`text-sm p-3 rounded-2xl rounded-tl-none leading-relaxed shadow-sm agent-message-content ${colors.isDark ? 'text-slate-200 bg-slate-800/70 border border-slate-700/40' : 'text-slate-700 bg-white border border-slate-200'}`}>
-                    <NodeRenderer content={msg.content} />
-                  </div>
-                  {/* 操作按钮组 */}
-                  <div className="absolute -right-2 top-1 flex flex-col gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
-                    <button
-                      onClick={() => handleCopy(msg.id, msg.content)}
-                      className={`p-1.5 rounded-full shadow-lg ${colors.isDark ? 'bg-slate-700 hover:bg-slate-600 text-slate-300' : 'bg-white hover:bg-slate-100 text-slate-500 border border-slate-200'}`}
-                      title="复制"
-                    >
-                      {copiedId === msg.id ? <Check size={12} className="text-green-400" /> : <Copy size={12} />}
-                    </button>
-                    <button
-                      onClick={() => handleReplyTo(msg)}
-                      disabled={isSimulating}
-                      className={`p-1.5 rounded-full shadow-lg disabled:opacity-50 ${colors.isDark ? 'bg-slate-700 hover:bg-slate-600 text-slate-300' : 'bg-white hover:bg-slate-100 text-slate-500 border border-slate-200'}`}
-                      title="引用回复"
-                    >
-                      <Reply size={12} />
-                    </button>
-                  </div>
+                  {msg.error ? (
+                    <div className={`text-sm p-3 rounded-2xl rounded-tl-none leading-relaxed shadow-sm border ${colors.isDark ? 'bg-red-950/30 border-red-500/30 text-red-300' : 'bg-red-50 border-red-300 text-red-600'}`}>
+                      <div className="flex items-center gap-2 mb-2">
+                        <AlertCircle size={14} />
+                        <span>分析失败</span>
+                      </div>
+                      <div className={`text-xs ${colors.isDark ? 'text-red-400/70' : 'text-red-500/70'}`}>{msg.error}</div>
+                      <div className="flex items-center gap-2 mt-2">
+                        <button
+                          onClick={() => handleRetryAgent(msg)}
+                          disabled={retryingAgentId === msg.agentId}
+                          className={`flex items-center gap-1 text-xs px-3 py-1.5 rounded-lg transition-colors ${
+                            retryingAgentId === msg.agentId
+                              ? 'opacity-50 cursor-not-allowed'
+                              : (colors.isDark ? 'text-amber-400 hover:text-amber-300 bg-amber-500/10 hover:bg-amber-500/20' : 'text-amber-600 hover:text-amber-500 bg-amber-500/10 hover:bg-amber-500/20')
+                          }`}
+                        >
+                          {retryingAgentId === msg.agentId ? <Loader2 size={12} className="animate-spin" /> : <RotateCcw size={12} />}
+                          {retryingAgentId === msg.agentId ? '重试中...' : (msg.meetingMode === 'smart' ? '重试并继续' : '重试')}
+                        </button>
+                        {msg.meetingMode === 'smart' && (
+                          <button
+                            onClick={() => handleAbandonMeeting(msg)}
+                            className={`flex items-center gap-1 text-xs px-3 py-1.5 rounded-lg transition-colors ${colors.isDark ? 'text-slate-400 bg-slate-500/10 hover:bg-slate-500/20' : 'text-slate-500 bg-slate-500/10 hover:bg-slate-500/20'}`}
+                          >
+                            <X size={12} />
+                            放弃剩余
+                          </button>
+                        )}
+                      </div>
+                    </div>
+                  ) : (
+                    <>
+                      <div className={`text-sm p-3 rounded-2xl rounded-tl-none leading-relaxed shadow-sm agent-message-content ${colors.isDark ? 'text-slate-200 bg-slate-800/70 border border-slate-700/40' : 'text-slate-700 bg-white border border-slate-200'}`}>
+                        <NodeRenderer content={msg.content} />
+                      </div>
+                      {/* 操作按钮组 */}
+                      <div className="absolute -right-2 top-1 flex flex-col gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
+                        <button
+                          onClick={() => handleCopy(msg.id, msg.content)}
+                          className={`p-1.5 rounded-full shadow-lg ${colors.isDark ? 'bg-slate-700 hover:bg-slate-600 text-slate-300' : 'bg-white hover:bg-slate-100 text-slate-500 border border-slate-200'}`}
+                          title="复制"
+                        >
+                          {copiedId === msg.id ? <Check size={12} className="text-green-400" /> : <Copy size={12} />}
+                        </button>
+                        <button
+                          onClick={() => handleReplyTo(msg)}
+                          disabled={isSimulating}
+                          className={`p-1.5 rounded-full shadow-lg disabled:opacity-50 ${colors.isDark ? 'bg-slate-700 hover:bg-slate-600 text-slate-300' : 'bg-white hover:bg-slate-100 text-slate-500 border border-slate-200'}`}
+                          title="引用回复"
+                        >
+                          <Reply size={12} />
+                        </button>
+                      </div>
+                    </>
+                  )}
                 </div>
               </div>
             </div>
@@ -617,8 +715,6 @@ export const AgentRoom: React.FC<AgentRoomProps> = ({ session, onSessionUpdate }
           </div>
         )}
       </div>
-
-      {/* Input Area */}
       <div className="p-3 border-t fin-divider-soft shrink-0">
         {/* 引用预览 */}
         {replyToMessage && (
@@ -764,27 +860,6 @@ export const AgentRoom: React.FC<AgentRoomProps> = ({ session, onSessionUpdate }
         </div>
       )}
 
-      {/* Toast 错误提示 */}
-      {toast.show && (
-        <div className="absolute top-4 left-1/2 -translate-x-1/2 z-50 animate-in fade-in slide-in-from-top-2 duration-300">
-          <div className={`flex items-center gap-2 px-4 py-3 rounded-lg shadow-lg border ${
-            toast.type === 'error'
-              ? 'bg-red-900/90 border-red-500/50 text-red-100'
-              : toast.type === 'warning'
-              ? 'bg-amber-900/90 border-amber-500/50 text-amber-100'
-              : 'bg-[var(--accent)]/90 border-accent/50 text-white'
-          }`}>
-            <AlertCircle size={18} />
-            <span className="text-sm">{toast.message}</span>
-            <button
-              onClick={() => hideToast()}
-              className="ml-2 hover:opacity-70"
-            >
-              <X size={14} />
-            </button>
-          </div>
-        </div>
-      )}
     </div>
   );
 };

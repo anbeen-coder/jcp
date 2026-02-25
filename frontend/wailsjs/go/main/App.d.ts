@@ -15,6 +15,8 @@ export function AddStrategy(arg1:models.Strategy):Promise<string>;
 
 export function AddToWatchlist(arg1:models.Stock):Promise<string>;
 
+export function CancelInterruptedMeeting(arg1:string):Promise<boolean>;
+
 export function CancelMeeting(arg1:string):Promise<boolean>;
 
 export function CheckForUpdate():Promise<services.UpdateInfo>;
@@ -90,6 +92,10 @@ export function OpenURL(arg1:string):Promise<void>;
 export function RemoveFromWatchlist(arg1:string):Promise<string>;
 
 export function RestartApp():Promise<string>;
+
+export function RetryAgent(arg1:string,arg2:string,arg3:string):Promise<models.ChatMessage>;
+
+export function RetryAgentAndContinue(arg1:string):Promise<Array<models.ChatMessage>>;
 
 export function SearchStocks(arg1:string):Promise<Array<services.StockSearchResult>>;
 

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/run-bigpig/jcp/internal/adk/openai"
 	"github.com/run-bigpig/jcp/internal/models"
 
 	"google.golang.org/adk/model"
@@ -79,7 +80,8 @@ func (m *Moderator) generate(ctx context.Context, prompt string) (string, error)
 			}
 		}
 	}
-	return result.String(), nil
+	// 过滤第三方工具调用标记后返回
+	return openai.FilterVendorToolCallMarkers(result.String()), nil
 }
 
 // buildAnalyzePrompt 构建意图分析 Prompt

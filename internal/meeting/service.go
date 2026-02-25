@@ -10,6 +10,7 @@ import (
 
 	"github.com/run-bigpig/jcp/internal/adk"
 	"github.com/run-bigpig/jcp/internal/adk/mcp"
+	"github.com/run-bigpig/jcp/internal/adk/openai"
 	"github.com/run-bigpig/jcp/internal/adk/tools"
 	"github.com/run-bigpig/jcp/internal/logger"
 	"github.com/run-bigpig/jcp/internal/memory"
@@ -33,6 +34,13 @@ const (
 	ModelCreationTimeout = 10 * time.Second // 模型创建的最大时长
 )
 
+// 重试配置常量
+const (
+	MaxAgentRetries  = 2                    // 单个专家最大重试次数
+	RetryBaseDelay   = 2 * time.Second      // 指数退避基础延迟
+	RetryMaxDelay    = 15 * time.Second     // 指数退避最大延迟
+)
+
 // 错误定义
 var (
 	ErrMeetingTimeout   = errors.New("会议超时，已返回部分结果")
@@ -41,9 +49,81 @@ var (
 	ErrNoAgents         = errors.New("没有可用的专家")
 )
 
+// isRetryableError 判断错误是否可重试
+// 超时、主动取消、配置错误不重试；网络错误、API 临时错误可重试
+func isRetryableError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+		return false
+	}
+	msg := err.Error()
+	// 配置类错误不重试
+	if strings.Contains(msg, "config") || strings.Contains(msg, "not found") {
+		return false
+	}
+	return true
+}
+
+// retryRun 带指数退避的重试包装
+// 在父 ctx 未取消的前提下，最多重试 maxRetries 次
+func retryRun(ctx context.Context, maxRetries int, fn func() (string, error)) (string, error) {
+	result, err := fn()
+	if err == nil || !isRetryableError(err) {
+		return result, err
+	}
+
+	var lastErr error = err
+	for i := 1; i <= maxRetries; i++ {
+		// 指数退避：baseDelay * 2^(i-1)，上限 RetryMaxDelay
+		delay := RetryBaseDelay * time.Duration(1<<(i-1))
+		if delay > RetryMaxDelay {
+			delay = RetryMaxDelay
+		}
+		log.Warn("retry %d/%d after %v, last error: %v", i, maxRetries, delay, lastErr)
+
+		select {
+		case <-ctx.Done():
+			return "", ctx.Err()
+		case <-time.After(delay):
+		}
+
+		result, err = fn()
+		if err == nil {
+			log.Info("retry %d/%d succeeded", i, maxRetries)
+			return result, nil
+		}
+		lastErr = err
+		if !isRetryableError(err) {
+			return "", err
+		}
+	}
+	return "", fmt.Errorf("重试 %d 次后仍失败: %w", maxRetries, lastErr)
+}
+
 // AIConfigResolver AI配置解析器函数类型
 // 根据 AIConfigID 返回对应的 AI 配置，如果 ID 为空或找不到则返回默认配置
 type AIConfigResolver func(aiConfigID string) *models.AIConfig
+
+// MeetingState 中断的会议状态缓存（用于失败后恢复继续执行）
+type MeetingState struct {
+	AIConfig       *models.AIConfig
+	Stock          models.Stock
+	Query          string
+	Position       *models.StockPosition
+	SelectedAgents []models.AgentConfig // 全部选中的专家
+	History        []DiscussionEntry    // 已完成的讨论历史
+	Responses      []ChatResponse       // 已完成的响应
+	FailedIndex    int                  // 失败的专家在 selectedAgents 中的索引
+	MemoryContext  string               // 记忆上下文
+	StockMemory    *memory.StockMemory  // 股票记忆引用
+	Moderator      *Moderator           // 主持人引用（用于最终总结）
+	CreatedAt      time.Time            // 创建时间（用于 TTL 清理）
+}
+
+// MeetingStateTTL 中断状态缓存过期时间
+const MeetingStateTTL = 10 * time.Minute
 
 // Service 会议室服务，编排多专家并行分析
 type Service struct {
@@ -54,14 +134,17 @@ type Service struct {
 	memoryAIConfig    *models.AIConfig // 记忆管理使用的 LLM 配置
 	moderatorAIConfig *models.AIConfig // 意图分析(小韭菜)使用的 LLM 配置
 	aiConfigResolver  AIConfigResolver // AI配置解析器
+	meetingStates     map[string]*MeetingState // 中断的会议状态缓存，key: stockCode
+	meetingStatesMu   sync.RWMutex
 }
 
 // NewServiceFull 创建完整配置的会议室服务
 func NewServiceFull(registry *tools.Registry, mcpMgr *mcp.Manager) *Service {
 	return &Service{
-		modelFactory: adk.NewModelFactory(),
-		toolRegistry: registry,
-		mcpManager:   mcpMgr,
+		modelFactory:  adk.NewModelFactory(),
+		toolRegistry:  registry,
+		mcpManager:    mcpMgr,
+		meetingStates: make(map[string]*MeetingState),
 	}
 }
 
@@ -87,6 +170,7 @@ func (s *Service) SetAIConfigResolver(resolver AIConfigResolver) {
 
 // ChatRequest 聊天请求
 type ChatRequest struct {
+	StockCode    string                `json:"stockCode"`    // 股票代码（用于状态缓存 key）
 	Stock        models.Stock          `json:"stock"`
 	KLineData    []models.KLineData    `json:"klineData"`
 	Agents       []models.AgentConfig  `json:"agents"`
@@ -96,14 +180,22 @@ type ChatRequest struct {
 	Position     *models.StockPosition `json:"position"`  // 用户持仓信息
 }
 
+// 会议模式常量
+const (
+	MeetingModeSmart  = "smart"  // 串行智能模式（小韭菜编排）
+	MeetingModeDirect = "direct" // 独立模式（@ 指定专家）
+)
+
 // ChatResponse 聊天响应
 type ChatResponse struct {
-	AgentID   string `json:"agentId"`
-	AgentName string `json:"agentName"`
-	Role      string `json:"role"`
-	Content   string `json:"content"`
-	Round     int    `json:"round"`
-	MsgType   string `json:"msgType"` // opening/opinion/summary
+	AgentID     string `json:"agentId"`
+	AgentName   string `json:"agentName"`
+	Role        string `json:"role"`
+	Content     string `json:"content"`
+	Round       int    `json:"round"`
+	MsgType     string `json:"msgType"`                // opening/opinion/summary
+	Error       string `json:"error,omitempty"`         // 失败时的错误信息，前端据此显示重试按钮
+	MeetingMode string `json:"meetingMode,omitempty"`   // smart=串行, direct=独立
 }
 
 // ResponseCallback 响应回调函数类型
@@ -250,12 +342,13 @@ func (s *Service) RunSmartMeetingWithCallback(ctx context.Context, aiConfig *mod
 
 	// 添加开场白并立即回调
 	openingResp := ChatResponse{
-		AgentID:   "moderator",
-		AgentName: "小韭菜",
-		Role:      "会议主持",
-		Content:   decision.Opening,
-		Round:     0,
-		MsgType:   "opening",
+		AgentID:     "moderator",
+		AgentName:   "小韭菜",
+		Role:        "会议主持",
+		Content:     decision.Opening,
+		Round:       0,
+		MsgType:     "opening",
+		MeetingMode: MeetingModeSmart,
 	}
 	responses = append(responses, openingResp)
 	if respCallback != nil {
@@ -316,13 +409,23 @@ func (s *Service) RunSmartMeetingWithCallback(ctx context.Context, aiConfig *mod
 			previousContext = memoryContext + "\n" + previousContext
 		}
 
-		// 运行单个专家（带超时控制）
-		agentCtx, agentCancel := context.WithTimeout(meetingCtx, AgentTimeout)
-		content, err := s.runSingleAgentWithHistory(agentCtx, builder, &agentCfg, &req.Stock, req.Query, previousContext, progressCallback, req.Position)
-		agentCancel()
+		// 运行单个专家（带超时控制 + 指数退避重试）
+		content, err := retryRun(meetingCtx, MaxAgentRetries, func() (string, error) {
+			agentCtx, agentCancel := context.WithTimeout(meetingCtx, AgentTimeout)
+			defer agentCancel()
+			return s.runSingleAgentWithHistory(agentCtx, builder, &agentCfg, &req.Stock, req.Query, previousContext, progressCallback, req.Position)
+		})
 
 		if err != nil {
-			// 发送专家完成事件（即使失败）
+			// 发送 agent_error 事件通知前端
+			if progressCallback != nil {
+				progressCallback(ProgressEvent{
+					Type:      "agent_error",
+					AgentID:   agentCfg.ID,
+					AgentName: agentCfg.Name,
+					Detail:    err.Error(),
+				})
+			}
 			if progressCallback != nil {
 				progressCallback(ProgressEvent{
 					Type:      "agent_done",
@@ -330,12 +433,61 @@ func (s *Service) RunSmartMeetingWithCallback(ctx context.Context, aiConfig *mod
 					AgentName: agentCfg.Name,
 				})
 			}
-			if errors.Is(err, context.DeadlineExceeded) {
-				log.Warn("agent %s timeout", agentCfg.ID)
-			} else {
-				log.Error("agent %s error: %v", agentCfg.ID, err)
+			log.Error("agent %s failed after retries: %v", agentCfg.ID, err)
+
+			// 将失败的 agent 加入响应，标记错误
+			failedResp := ChatResponse{
+				AgentID:     agentCfg.ID,
+				AgentName:   agentCfg.Name,
+				Role:        agentCfg.Role,
+				Content:     "",
+				Round:       1,
+				MsgType:     "opinion",
+				Error:       err.Error(),
+				MeetingMode: MeetingModeSmart,
 			}
-			continue
+			responses = append(responses, failedResp)
+			if respCallback != nil {
+				respCallback(failedResp)
+			}
+
+			// 缓存中断状态，用于后续恢复继续执行
+			if req.StockCode != "" {
+				s.cacheMeetingState(req.StockCode, &MeetingState{
+					AIConfig:       aiConfig,
+					Stock:          req.Stock,
+					Query:          req.Query,
+					Position:       req.Position,
+					SelectedAgents: selectedAgents,
+					History:        history,
+					Responses:      responses,
+					FailedIndex:    i,
+					MemoryContext:  memoryContext,
+					StockMemory:    stockMemory,
+					Moderator:      moderator,
+					CreatedAt:      time.Now(),
+				})
+
+				// 收集剩余专家 ID
+				remainingIDs := make([]string, 0, len(selectedAgents)-i-1)
+				for _, ra := range selectedAgents[i+1:] {
+					remainingIDs = append(remainingIDs, ra.ID)
+				}
+
+				// 发送 meeting_interrupted 事件
+				if progressCallback != nil {
+					progressCallback(ProgressEvent{
+						Type:      "meeting_interrupted",
+						AgentID:   agentCfg.ID,
+						AgentName: agentCfg.Name,
+						Detail:    err.Error(),
+						Content:   strings.Join(remainingIDs, ","),
+					})
+				}
+			}
+
+			// 中断串行执行，不再继续后续专家
+			break
 		}
 
 		// 发送专家完成事件
@@ -349,12 +501,13 @@ func (s *Service) RunSmartMeetingWithCallback(ctx context.Context, aiConfig *mod
 
 		// 添加到响应并立即回调
 		resp := ChatResponse{
-			AgentID:   agentCfg.ID,
-			AgentName: agentCfg.Name,
-			Role:      agentCfg.Role,
-			Content:   content,
-			Round:     1,
-			MsgType:   "opinion",
+			AgentID:     agentCfg.ID,
+			AgentName:   agentCfg.Name,
+			Role:        agentCfg.Role,
+			Content:     content,
+			Round:       1,
+			MsgType:     "opinion",
+			MeetingMode: MeetingModeSmart,
 		}
 		responses = append(responses, resp)
 		if respCallback != nil {
@@ -371,6 +524,17 @@ func (s *Service) RunSmartMeetingWithCallback(ctx context.Context, aiConfig *mod
 		})
 
 		log.Debug("agent %s done, content len: %d", agentCfg.ID, len(content))
+	}
+
+	// 检查是否被中断（有缓存状态说明中断了，跳过总结）
+	if req.StockCode != "" {
+		s.meetingStatesMu.RLock()
+		_, interrupted := s.meetingStates[req.StockCode]
+		s.meetingStatesMu.RUnlock()
+		if interrupted {
+			log.Info("meeting interrupted for %s, skipping summary", req.StockCode)
+			return responses, nil
+		}
 	}
 
 	// 最终轮：小韭菜总结（带超时）
@@ -407,12 +571,13 @@ func (s *Service) RunSmartMeetingWithCallback(ctx context.Context, aiConfig *mod
 
 	if summary != "" {
 		summaryResp := ChatResponse{
-			AgentID:   "moderator",
-			AgentName: "小韭菜",
-			Role:      "会议主持",
-			Content:   summary,
-			Round:     2,
-			MsgType:   "summary",
+			AgentID:     "moderator",
+			AgentName:   "小韭菜",
+			Role:        "会议主持",
+			Content:     summary,
+			Round:       2,
+			MsgType:     "summary",
+			MeetingMode: MeetingModeSmart,
 		}
 		responses = append(responses, summaryResp)
 		if respCallback != nil {
@@ -480,26 +645,34 @@ func (s *Service) runAgentsParallel(ctx context.Context, defaultLLM model.LLM, d
 			}
 			builder := s.createBuilder(agentLLM, agentAIConfig)
 
-			// 单个 Agent 超时控制
-			agentCtx, agentCancel := context.WithTimeout(parallelCtx, AgentTimeout)
-			defer agentCancel()
-
-			content, err := s.runSingleAgentWithContext(agentCtx, builder, &cfg, &req.Stock, req.Query, req.ReplyContent, req.Position)
+			// 单个 Agent 带指数退避重试
+			content, err := retryRun(parallelCtx, MaxAgentRetries, func() (string, error) {
+				agentCtx, agentCancel := context.WithTimeout(parallelCtx, AgentTimeout)
+				defer agentCancel()
+				return s.runSingleAgentWithContext(agentCtx, builder, &cfg, &req.Stock, req.Query, req.ReplyContent, req.Position)
+			})
 			if err != nil {
-				if errors.Is(err, context.DeadlineExceeded) {
-					log.Warn("agent %s timeout", cfg.ID)
-				} else {
-					log.Error("agent %s error: %v", cfg.ID, err)
-				}
+				log.Error("agent %s failed after retries: %v", cfg.ID, err)
+				mu.Lock()
+				responses = append(responses, ChatResponse{
+					AgentID:     cfg.ID,
+					AgentName:   cfg.Name,
+					Role:        cfg.Role,
+					MsgType:     "opinion",
+					Error:       err.Error(),
+					MeetingMode: MeetingModeDirect,
+				})
+				mu.Unlock()
 				return
 			}
 
 			mu.Lock()
 			responses = append(responses, ChatResponse{
-				AgentID:   cfg.ID,
-				AgentName: cfg.Name,
-				Role:      cfg.Role,
-				Content:   content,
+				AgentID:     cfg.ID,
+				AgentName:   cfg.Name,
+				Role:        cfg.Role,
+				Content:     content,
+				MeetingMode: MeetingModeDirect,
 			})
 			mu.Unlock()
 			log.Debug("agent %s done, content len: %d", cfg.ID, len(content))
@@ -563,7 +736,8 @@ func (s *Service) runSingleAgentWithContext(ctx context.Context, builder *adk.Ex
 		}
 	}
 
-	return content, nil
+	// 过滤第三方工具调用标记后返回
+	return openai.FilterVendorToolCallMarkers(content), nil
 }
 
 // filterAgentsOrdered 按指定顺序筛选专家（保持小韭菜选择的顺序）
@@ -725,7 +899,8 @@ func (s *Service) runSingleAgentWithHistory(
 		}
 	}
 
-	return content, nil
+	// 过滤第三方工具调用标记后返回
+	return openai.FilterVendorToolCallMarkers(content), nil
 }
 
 // createBuilder 创建 ExpertAgentBuilder
@@ -737,4 +912,319 @@ func (s *Service) createBuilder(llm model.LLM, aiConfig *models.AIConfig) *adk.E
 		return adk.NewExpertAgentBuilderWithTools(llm, aiConfig, s.toolRegistry)
 	}
 	return adk.NewExpertAgentBuilder(llm, aiConfig)
+}
+
+// RetrySingleAgent 重试单个失败的专家（前端手动重试调用）
+func (s *Service) RetrySingleAgent(
+	ctx context.Context,
+	aiConfig *models.AIConfig,
+	agentCfg *models.AgentConfig,
+	stock *models.Stock,
+	query string,
+	progressCallback ProgressCallback,
+	position *models.StockPosition,
+) (ChatResponse, error) {
+	// 获取该专家的 AI 配置
+	agentAIConfig := aiConfig
+	if s.aiConfigResolver != nil && agentCfg.AIConfigID != "" {
+		if resolved := s.aiConfigResolver(agentCfg.AIConfigID); resolved != nil {
+			agentAIConfig = resolved
+		}
+	}
+
+	agentLLM, err := s.modelFactory.CreateModel(ctx, agentAIConfig)
+	if err != nil {
+		return ChatResponse{}, fmt.Errorf("create model error: %w", err)
+	}
+	builder := s.createBuilder(agentLLM, agentAIConfig)
+
+	if progressCallback != nil {
+		progressCallback(ProgressEvent{
+			Type:      "agent_start",
+			AgentID:   agentCfg.ID,
+			AgentName: agentCfg.Name,
+			Detail:    agentCfg.Role,
+		})
+	}
+
+	// 带指数退避重试
+	content, err := retryRun(ctx, MaxAgentRetries, func() (string, error) {
+		agentCtx, cancel := context.WithTimeout(ctx, AgentTimeout)
+		defer cancel()
+		return s.runSingleAgentWithHistory(agentCtx, builder, agentCfg, stock, query, "", progressCallback, position)
+	})
+
+	if progressCallback != nil {
+		progressCallback(ProgressEvent{
+			Type:      "agent_done",
+			AgentID:   agentCfg.ID,
+			AgentName: agentCfg.Name,
+		})
+	}
+
+	if err != nil {
+		return ChatResponse{
+			AgentID:     agentCfg.ID,
+			AgentName:   agentCfg.Name,
+			Role:        agentCfg.Role,
+			MsgType:     "opinion",
+			Error:       err.Error(),
+			MeetingMode: MeetingModeDirect,
+		}, err
+	}
+
+	return ChatResponse{
+		AgentID:     agentCfg.ID,
+		AgentName:   agentCfg.Name,
+		Role:        agentCfg.Role,
+		Content:     content,
+		Round:       1,
+		MsgType:     "opinion",
+		MeetingMode: MeetingModeDirect,
+	}, nil
+}
+
+// cacheMeetingState 缓存中断的会议状态
+func (s *Service) cacheMeetingState(stockCode string, state *MeetingState) {
+	s.meetingStatesMu.Lock()
+	defer s.meetingStatesMu.Unlock()
+	s.meetingStates[stockCode] = state
+	log.Info("cached meeting state for %s, failedIndex=%d", stockCode, state.FailedIndex)
+}
+
+// CancelInterruptedMeeting 取消中断的会议（用户放弃重试时调用）
+func (s *Service) CancelInterruptedMeeting(stockCode string) {
+	s.meetingStatesMu.Lock()
+	defer s.meetingStatesMu.Unlock()
+	delete(s.meetingStates, stockCode)
+	log.Info("cancelled interrupted meeting for %s", stockCode)
+}
+
+// HasInterruptedMeeting 检查是否有中断的会议
+func (s *Service) HasInterruptedMeeting(stockCode string) bool {
+	s.meetingStatesMu.RLock()
+	defer s.meetingStatesMu.RUnlock()
+	state, ok := s.meetingStates[stockCode]
+	if !ok {
+		return false
+	}
+	// 检查 TTL
+	if time.Since(state.CreatedAt) > MeetingStateTTL {
+		return false
+	}
+	return true
+}
+
+// ContinueMeeting 恢复中断的会议：重试失败专家 + 继续剩余专家 + 总结
+func (s *Service) ContinueMeeting(
+	ctx context.Context,
+	stockCode string,
+	respCallback ResponseCallback,
+	progressCallback ProgressCallback,
+) ([]ChatResponse, error) {
+	// 取出缓存状态
+	s.meetingStatesMu.Lock()
+	state, ok := s.meetingStates[stockCode]
+	if ok {
+		delete(s.meetingStates, stockCode)
+	}
+	s.meetingStatesMu.Unlock()
+
+	if !ok || time.Since(state.CreatedAt) > MeetingStateTTL {
+		return nil, fmt.Errorf("没有可恢复的会议状态")
+	}
+
+	log.Info("continuing meeting for %s, failedIndex=%d, total=%d",
+		stockCode, state.FailedIndex, len(state.SelectedAgents))
+
+	// 设置会议超时
+	meetingCtx, meetingCancel := context.WithTimeout(ctx, MeetingTimeout)
+	defer meetingCancel()
+
+	responses := state.Responses
+	history := state.History
+
+	// 从失败的专家开始，依次执行
+	startIndex := state.FailedIndex
+	for i := startIndex; i < len(state.SelectedAgents); i++ {
+		select {
+		case <-meetingCtx.Done():
+			log.Warn("continue meeting timeout, got %d responses", len(responses))
+			return responses, ErrMeetingTimeout
+		default:
+		}
+
+		agentCfg := state.SelectedAgents[i]
+		log.Debug("continue: agent %d/%d: %s", i+1, len(state.SelectedAgents), agentCfg.Name)
+
+		// 获取该专家的 AI 配置
+		agentAIConfig := state.AIConfig
+		if s.aiConfigResolver != nil && agentCfg.AIConfigID != "" {
+			if resolved := s.aiConfigResolver(agentCfg.AIConfigID); resolved != nil {
+				agentAIConfig = resolved
+			}
+		}
+
+		agentLLM, err := s.modelFactory.CreateModel(meetingCtx, agentAIConfig)
+		if err != nil {
+			log.Error("continue: create agent LLM error: %v", err)
+			continue
+		}
+		builder := s.createBuilder(agentLLM, agentAIConfig)
+
+		if progressCallback != nil {
+			progressCallback(ProgressEvent{
+				Type:      "agent_start",
+				AgentID:   agentCfg.ID,
+				AgentName: agentCfg.Name,
+				Detail:    agentCfg.Role,
+			})
+		}
+
+		previousContext := s.buildPreviousContext(history)
+		if state.MemoryContext != "" {
+			previousContext = state.MemoryContext + "\n" + previousContext
+		}
+
+		content, err := retryRun(meetingCtx, MaxAgentRetries, func() (string, error) {
+			agentCtx, agentCancel := context.WithTimeout(meetingCtx, AgentTimeout)
+			defer agentCancel()
+			return s.runSingleAgentWithHistory(agentCtx, builder, &agentCfg, &state.Stock, state.Query, previousContext, progressCallback, state.Position)
+		})
+
+		if err != nil {
+			if progressCallback != nil {
+				progressCallback(ProgressEvent{Type: "agent_error", AgentID: agentCfg.ID, AgentName: agentCfg.Name, Detail: err.Error()})
+				progressCallback(ProgressEvent{Type: "agent_done", AgentID: agentCfg.ID, AgentName: agentCfg.Name})
+			}
+			log.Error("continue: agent %s failed: %v", agentCfg.ID, err)
+
+			failedResp := ChatResponse{
+				AgentID: agentCfg.ID, AgentName: agentCfg.Name, Role: agentCfg.Role,
+				Round: 1, MsgType: "opinion", Error: err.Error(), MeetingMode: MeetingModeSmart,
+			}
+			responses = append(responses, failedResp)
+			if respCallback != nil {
+				respCallback(failedResp)
+			}
+
+			// 再次缓存，允许用户继续重试
+			s.cacheMeetingState(stockCode, &MeetingState{
+				AIConfig:       state.AIConfig,
+				Stock:          state.Stock,
+				Query:          state.Query,
+				Position:       state.Position,
+				SelectedAgents: state.SelectedAgents,
+				History:        history,
+				Responses:      responses,
+				FailedIndex:    i,
+				MemoryContext:  state.MemoryContext,
+				StockMemory:    state.StockMemory,
+				Moderator:      state.Moderator,
+				CreatedAt:      time.Now(),
+			})
+
+			remainingIDs := make([]string, 0, len(state.SelectedAgents)-i-1)
+			for _, ra := range state.SelectedAgents[i+1:] {
+				remainingIDs = append(remainingIDs, ra.ID)
+			}
+			if progressCallback != nil {
+				progressCallback(ProgressEvent{
+					Type: "meeting_interrupted", AgentID: agentCfg.ID, AgentName: agentCfg.Name,
+					Detail: err.Error(), Content: strings.Join(remainingIDs, ","),
+				})
+			}
+			break
+		}
+
+		if progressCallback != nil {
+			progressCallback(ProgressEvent{Type: "agent_done", AgentID: agentCfg.ID, AgentName: agentCfg.Name})
+		}
+
+		resp := ChatResponse{
+			AgentID: agentCfg.ID, AgentName: agentCfg.Name, Role: agentCfg.Role,
+			Content: content, Round: 1, MsgType: "opinion", MeetingMode: MeetingModeSmart,
+		}
+		responses = append(responses, resp)
+		if respCallback != nil {
+			respCallback(resp)
+		}
+
+		history = append(history, DiscussionEntry{
+			Round: 1, AgentID: agentCfg.ID, AgentName: agentCfg.Name,
+			Role: agentCfg.Role, Content: content,
+		})
+	}
+
+	// 检查是否再次中断
+	s.meetingStatesMu.RLock()
+	_, stillInterrupted := s.meetingStates[stockCode]
+	s.meetingStatesMu.RUnlock()
+	if stillInterrupted {
+		return responses, nil
+	}
+
+	// 全部完成，执行小韭菜总结
+	return s.runMeetingSummary(meetingCtx, state, history, responses, respCallback, progressCallback)
+}
+
+// runMeetingSummary 执行小韭菜总结（ContinueMeeting 专用）
+func (s *Service) runMeetingSummary(
+	ctx context.Context,
+	state *MeetingState,
+	history []DiscussionEntry,
+	responses []ChatResponse,
+	respCallback ResponseCallback,
+	progressCallback ProgressCallback,
+) ([]ChatResponse, error) {
+	if progressCallback != nil {
+		progressCallback(ProgressEvent{
+			Type: "agent_start", AgentID: "moderator",
+			AgentName: "小韭菜", Detail: "总结讨论",
+		})
+	}
+
+	summaryCtx, summaryCancel := context.WithTimeout(ctx, ModeratorTimeout)
+	summary, err := state.Moderator.Summarize(summaryCtx, &state.Stock, state.Query, history)
+	summaryCancel()
+
+	if progressCallback != nil {
+		progressCallback(ProgressEvent{
+			Type: "agent_done", AgentID: "moderator", AgentName: "小韭菜",
+		})
+	}
+
+	if err != nil {
+		if errors.Is(err, context.DeadlineExceeded) {
+			log.Warn("continue summary timeout")
+		} else {
+			log.Error("continue summary error: %v", err)
+		}
+		return responses, nil
+	}
+
+	if summary != "" {
+		summaryResp := ChatResponse{
+			AgentID: "moderator", AgentName: "小韭菜",
+			Role: "会议主持", Content: summary,
+			Round: 2, MsgType: "summary", MeetingMode: MeetingModeSmart,
+		}
+		responses = append(responses, summaryResp)
+		if respCallback != nil {
+			respCallback(summaryResp)
+		}
+	}
+
+	// 异步保存记忆
+	if s.memoryManager != nil && state.StockMemory != nil && summary != "" {
+		go func() {
+			bgCtx := context.Background()
+			keyPoints := s.extractKeyPointsFromHistory(bgCtx, history)
+			if err := s.memoryManager.AddRound(bgCtx, state.StockMemory, state.Query, summary, keyPoints); err != nil {
+				log.Error("save memory error: %v", err)
+			}
+		}()
+	}
+
+	return responses, nil
 }

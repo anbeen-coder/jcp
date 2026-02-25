@@ -242,6 +242,7 @@ export namespace models {
 	    timeout: number;
 	    isDefault: boolean;
 	    useResponses: boolean;
+	    noSystemRole: boolean;
 	    project: string;
 	    location: string;
 	    credentialsJson: string;
@@ -263,6 +264,7 @@ export namespace models {
 	        this.timeout = source["timeout"];
 	        this.isDefault = source["isDefault"];
 	        this.useResponses = source["useResponses"];
+	        this.noSystemRole = source["noSystemRole"];
 	        this.project = source["project"];
 	        this.location = source["location"];
 	        this.credentialsJson = source["credentialsJson"];
@@ -455,6 +457,8 @@ export namespace models {
 	    mentions?: string[];
 	    round?: number;
 	    msgType?: string;
+	    error?: string;
+	    meetingMode?: string;
 	
 	    static createFrom(source: any = {}) {
 	        return new ChatMessage(source);
@@ -472,6 +476,8 @@ export namespace models {
 	        this.mentions = source["mentions"];
 	        this.round = source["round"];
 	        this.msgType = source["msgType"];
+	        this.error = source["error"];
+	        this.meetingMode = source["meetingMode"];
 	    }
 	}
 	export class KLineData {

@@ -750,8 +750,8 @@ type tradeDatesCache struct {
 
 // holidayData 节假日数据结构
 type holidayData struct {
-	Year  int           `json:"year"`
-	Days  []holidayDay  `json:"days"`
+	Year int          `json:"year"`
+	Days []holidayDay `json:"days"`
 }
 
 type holidayDay struct {
