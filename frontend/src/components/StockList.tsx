@@ -4,6 +4,7 @@ import { searchStocks, StockSearchResult } from '../services/stockService';
 import { TrendingUp, TrendingDown, Search, X } from 'lucide-react';
 import { MarketIndices } from './MarketIndices';
 import { useTheme } from '../contexts/ThemeContext';
+import { useCandleColor } from '../contexts/CandleColorContext';
 
 interface StockListProps {
   stocks: Stock[]; // The current watchlist
@@ -23,6 +24,7 @@ export const StockList: React.FC<StockListProps> = ({
   marketIndices
 }) => {
   const { colors } = useTheme();
+  const cc = useCandleColor();
   const [searchTerm, setSearchTerm] = useState('');
   const [searchResults, setSearchResults] = useState<StockSearchResult[]>([]);
   const [showDropdown, setShowDropdown] = useState(false);
@@ -118,7 +120,7 @@ export const StockList: React.FC<StockListProps> = ({
 
           {/* 搜索下拉结果 */}
           {showDropdown && (
-            <div className={`absolute top-full left-0 right-0 mt-1 max-h-64 overflow-y-auto rounded-lg shadow-xl ${colors.isDark ? 'bg-slate-800 border border-slate-600' : 'bg-white border border-slate-300'}`}>
+            <div className={`absolute top-full left-0 right-0 mt-1 max-h-64 overflow-y-auto rounded-lg shadow-xl text-left ${colors.isDark ? 'bg-slate-800 border border-slate-600' : 'bg-white border border-slate-300'}`}>
               {searchResults.map((result) => (
                 <div
                   key={result.symbol}
@@ -172,10 +174,10 @@ export const StockList: React.FC<StockListProps> = ({
                   <div className={`text-xs font-mono truncate ${colors.isDark ? 'text-slate-400' : 'text-slate-500'}`}>{stock.symbol}</div>
                 </div>
                 <div className="text-right">
-                  <div className={`font-mono ${isPositive ? 'text-red-500' : 'text-green-500'}`}>
+                  <div className={`font-mono ${cc.getColorClass(isPositive)}`}>
                     {stock.price.toFixed(2)}
                   </div>
-                  <div className={`text-xs font-mono flex items-center justify-end ${isPositive ? 'text-red-500' : 'text-green-500'}`}>
+                  <div className={`text-xs font-mono flex items-center justify-end ${cc.getColorClass(isPositive)}`}>
                     {isPositive ? <TrendingUp size={12} className="mr-1"/> : <TrendingDown size={12} className="mr-1"/>}
                     {isPositive ? '+' : ''}{stock.changePercent.toFixed(2)}%
                   </div>

@@ -6,6 +6,7 @@ import { getMCPServers, MCPServerConfig, MCPServerStatus, testMCPConnection, get
 import { checkForUpdate, doUpdate, restartApp, getCurrentVersion, onUpdateProgress, UpdateInfo, UpdateProgress } from '../services/updateService';
 import { getStrategies, getActiveStrategyID, setActiveStrategy, deleteStrategy, generateStrategy, updateStrategy, enhancePrompt, Strategy, StrategyAgent } from '../services/strategyService';
 import { useTheme } from '../contexts/ThemeContext';
+import { useCandleColor, CandleColorMode } from '../contexts/CandleColorContext';
 
 interface AIConfig {
   id: string;
@@ -51,7 +52,7 @@ interface OpenClawConfig {
   apiKey: string;
 }
 
-type TabType = 'provider' | 'intent' | 'strategy' | 'mcp' | 'memory' | 'proxy' | 'openclaw' | 'update';
+type TabType = 'provider' | 'intent' | 'strategy' | 'mcp' | 'memory' | 'chart' | 'proxy' | 'openclaw' | 'update';
 
 interface SettingsDialogProps {
   isOpen: boolean;
@@ -205,6 +206,7 @@ export const SettingsDialog: React.FC<SettingsDialogProps> = ({ isOpen, onClose 
     openClaw: OpenClawConfig;
     moderatorAiId: string;
     strategyAiId: string;
+    candleColorMode: string;
   }>) => {
     // 合并待保存的更新
     pendingUpdatesRef.current = { ...pendingUpdatesRef.current, ...updates };
@@ -239,6 +241,7 @@ export const SettingsDialog: React.FC<SettingsDialogProps> = ({ isOpen, onClose 
     { id: 'strategy', label: '策略管理', icon: <Layers className="h-4 w-4" /> },
     { id: 'mcp', label: 'MCP服务', icon: <Plug className="h-4 w-4" /> },
     { id: 'memory', label: '记忆管理', icon: <Brain className="h-4 w-4" /> },
+    { id: 'chart', label: '图表设置', icon: <Sliders className="h-4 w-4" /> },
     { id: 'proxy', label: '网络代理', icon: <Globe className="h-4 w-4" /> },
     { id: 'openclaw', label: 'OpenClaw', icon: <Plug className="h-4 w-4" /> },
     { id: 'update', label: '软件更新', icon: <RefreshCw className="h-4 w-4" /> },
@@ -267,7 +270,7 @@ export const SettingsDialog: React.FC<SettingsDialogProps> = ({ isOpen, onClose 
             ))}
           </div>
           {/* 右侧内容 */}
-          <div className="flex-1 overflow-y-auto p-4 fin-scrollbar">
+          <div className="flex-1 overflow-y-auto p-4 fin-scrollbar text-left">
             {activeTab === 'provider' && (
               <ProviderSettings
                 configs={aiConfigs}
@@ -342,6 +345,9 @@ export const SettingsDialog: React.FC<SettingsDialogProps> = ({ isOpen, onClose 
                 }}
               />
             )}
+            {activeTab === 'chart' && (
+              <ChartColorSettings saveConfig={saveConfig} />
+            )}
             {activeTab === 'proxy' && (
               <ProxySettings
                 config={proxyConfig}
@@ -399,13 +405,14 @@ const Header: React.FC<{ onClose: () => void }> = ({ onClose }) => {
 };
 
 // ========== Provider 设置选项卡 ==========
-const PROVIDERS = ['openai', 'gemini', 'vertexai'] as const;
+const PROVIDERS = ['openai', 'gemini', 'vertexai', 'anthropic'] as const;
 type ProviderType = typeof PROVIDERS[number];
 
 const PROVIDER_LABELS: Record<ProviderType, string> = {
   openai: 'OpenAI',
   gemini: 'Gemini',
   vertexai: 'Vertex AI',
+  anthropic: 'Anthropic',
 };
 
 interface ProviderSettingsProps {
@@ -637,7 +644,7 @@ const AddAIConfigModal: React.FC<AddAIConfigModalProps> = ({ selectedType, onSel
               <button
                 key={p}
                 onClick={() => onSelectType(p)}
-                className={`flex-1 px-3 py-2 text-sm rounded-lg transition-all ${
+                className={`flex-1 px-2 py-2 text-sm rounded-lg transition-all whitespace-nowrap ${
                   selectedType === p
                     ? 'bg-gradient-to-br from-[var(--accent)] to-[var(--accent-2)] text-white'
                     : (colors.isDark ? 'fin-panel border fin-divider text-slate-400 hover:text-white' : 'fin-panel border fin-divider text-slate-500 hover:text-slate-800')
@@ -1032,6 +1039,7 @@ const getDefaultBaseUrl = (provider: string): string => {
   switch (provider) {
     case 'openai': return 'https://api.openai.com/v1';
     case 'gemini': return 'https://generativelanguage.googleapis.com';
+    case 'anthropic': return 'https://api.anthropic.com';
     default: return '';
   }
 };
@@ -1041,6 +1049,7 @@ const getDefaultModel = (provider: string): string => {
     case 'openai': return 'gpt-5.2';
     case 'gemini': return 'gemini-2.5-flash';
     case 'vertexai': return 'gemini-2.5-flash';
+    case 'anthropic': return 'claude-sonnet-4-20250514';
     default: return '';
   }
 };
@@ -1457,6 +1466,93 @@ const MCPEditForm: React.FC<MCPEditFormProps> = ({ server, status, tools, onBack
           </div>
         </div>
       )}
+    </div>
+  );
+};
+
+// ========== 图表颜色设置选项卡 ==========
+const ChartColorSettings: React.FC<{ saveConfig: (updates: { candleColorMode: string }) => void }> = ({ saveConfig }) => {
+  const { colors } = useTheme();
+  const { mode, setMode } = useCandleColor();
+
+  const options: { value: CandleColorMode; label: string; upLabel: string; downLabel: string; upCls: string; downCls: string }[] = [
+    { value: 'red-up', label: '红涨绿跌', upLabel: '涨', downLabel: '跌', upCls: 'text-red-500', downCls: 'text-green-500' },
+    { value: 'green-up', label: '绿涨红跌', upLabel: '涨', downLabel: '跌', upCls: 'text-green-500', downCls: 'text-red-500' },
+  ];
+
+  return (
+    <div className="space-y-6">
+      <div>
+        <h3 className={`font-medium ${colors.isDark ? 'text-white' : 'text-slate-800'}`}>涨跌颜色</h3>
+        <p className={`text-xs mt-1 ${colors.isDark ? 'text-slate-400' : 'text-slate-500'}`}>
+          设置图表及行情中涨跌的显示颜色，切换后全局生效
+        </p>
+      </div>
+      <div className="grid grid-cols-2 gap-3">
+        {options.map(opt => (
+          <button
+            key={opt.value}
+            onClick={() => {
+              setMode(opt.value);
+              saveConfig({ candleColorMode: opt.value });
+            }}
+            className={`relative p-4 rounded-xl border-2 transition-all ${
+              mode === opt.value
+                ? 'border-[var(--accent)] bg-[var(--accent)]/10'
+                : (colors.isDark ? 'border-slate-700 hover:border-slate-600 bg-slate-800/40' : 'border-slate-200 hover:border-slate-300 bg-slate-50')
+            }`}
+          >
+            {mode === opt.value && (
+              <div className="absolute top-2 right-2">
+                <Check className="h-4 w-4 text-[var(--accent)]" />
+              </div>
+            )}
+            <div className="flex items-center justify-center gap-4 mb-3">
+              <div className="flex flex-col items-center">
+                <div className={`text-2xl font-bold ${opt.upCls}`}>▲</div>
+                <span className={`text-xs mt-1 ${opt.upCls}`}>{opt.upLabel}</span>
+              </div>
+              <div className="flex flex-col items-center">
+                <div className={`text-2xl font-bold ${opt.downCls}`}>▼</div>
+                <span className={`text-xs mt-1 ${opt.downCls}`}>{opt.downLabel}</span>
+              </div>
+            </div>
+            <div className={`text-sm font-medium text-center ${colors.isDark ? 'text-slate-200' : 'text-slate-700'}`}>
+              {opt.label}
+            </div>
+          </button>
+        ))}
+      </div>
+
+      {/* K线预览 */}
+      <div>
+        <h4 className={`text-sm font-medium mb-2 ${colors.isDark ? 'text-slate-300' : 'text-slate-600'}`}>预览效果</h4>
+        <div className={`rounded-lg p-4 flex items-end justify-center gap-2 h-32 ${colors.isDark ? 'bg-slate-900/60' : 'bg-slate-100'}`}>
+          {/* [top, bodyTop, bodyBottom, bottom, isUp] — 百分比定位 */}
+          {([
+            [61,56,36,31,true],[54,51,31,26,false],[66,58,41,34,true],[71,66,38,31,true],
+            [64,61,44,36,false],[56,51,34,28,false],[68,64,46,41,true],[74,71,51,44,true],
+            [66,62,48,42,false],[72,68,54,48,true],
+          ] as [number,number,number,number,boolean][]).map(([top,bTop,bBot,bot,isUp], i) => {
+            const bg = isUp
+              ? (mode === 'red-up' ? 'bg-red-500' : 'bg-green-500')
+              : (mode === 'red-up' ? 'bg-green-500' : 'bg-red-500');
+            return (
+              <div key={i} className="relative" style={{ width: 10, height: '100%' }}>
+                {/* 上影线 */}
+                <div className={`absolute left-1/2 -translate-x-1/2 w-px ${bg}`}
+                  style={{ bottom: `${bTop}%`, height: `${top - bTop}%` }} />
+                {/* 实体 */}
+                <div className={`absolute left-0 right-0 rounded-[1px] ${bg}`}
+                  style={{ bottom: `${bBot}%`, height: `${bTop - bBot}%` }} />
+                {/* 下影线 */}
+                <div className={`absolute left-1/2 -translate-x-1/2 w-px ${bg}`}
+                  style={{ bottom: `${bot}%`, height: `${bBot - bot}%` }} />
+              </div>
+            );
+          })}
+        </div>
+      </div>
     </div>
   );
 };
