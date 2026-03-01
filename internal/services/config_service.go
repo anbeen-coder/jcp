@@ -161,10 +161,10 @@ func (cs *ConfigService) defaultConfig() *models.AppConfig {
 			CompressThreshold: 5,
 		},
 		Indicators: models.IndicatorConfig{
-			MA:   models.MAConfig{Enabled: false, Periods: []int{5, 10, 20}},
+			MA:   models.MAConfig{Enabled: true, Periods: []int{5, 10, 20}},
 			EMA:  models.EMAConfig{Enabled: false, Periods: []int{12, 26}},
 			BOLL: models.BOLLConfig{Enabled: false, Period: 20, Multiplier: 2.0},
-			MACD: models.MACDConfig{Enabled: false, Fast: 12, Slow: 26, Signal: 9},
+			MACD: models.MACDConfig{Enabled: true, Fast: 12, Slow: 26, Signal: 9},
 			RSI:  models.RSIConfig{Enabled: false, Period: 14},
 			KDJ:  models.KDJConfig{Enabled: false, Period: 9, K: 3, D: 3},
 		},

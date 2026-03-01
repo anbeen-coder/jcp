@@ -1621,12 +1621,12 @@ const ChartSettings: React.FC<{ saveConfig: (updates: any) => void }> = ({ saveC
             <div>
               <span className={labelCls}>周期</span>
               <input type="number" className={inputCls} value={indConfig.boll.period}
-                onChange={(e) => handleParamChange('boll', 'period', Number(e.target.value) || 20)} />
+                onChange={(e) => handleParamChange('boll', 'period', Math.max(1, Number(e.target.value) || 20))} />
             </div>
             <div>
               <span className={labelCls}>倍数</span>
               <input type="number" step="0.1" className={inputCls} value={indConfig.boll.multiplier}
-                onChange={(e) => handleParamChange('boll', 'multiplier', Number(e.target.value) || 2)} />
+                onChange={(e) => handleParamChange('boll', 'multiplier', Math.max(0.1, Number(e.target.value) || 2))} />
             </div>
           </div>
         </IndicatorRow>
@@ -1654,17 +1654,17 @@ const ChartSettings: React.FC<{ saveConfig: (updates: any) => void }> = ({ saveC
             <div>
               <span className={labelCls}>快线</span>
               <input type="number" className={inputCls} value={indConfig.macd.fast}
-                onChange={(e) => handleParamChange('macd', 'fast', Number(e.target.value) || 12)} />
+                onChange={(e) => handleParamChange('macd', 'fast', Math.max(1, Number(e.target.value) || 12))} />
             </div>
             <div>
               <span className={labelCls}>慢线</span>
               <input type="number" className={inputCls} value={indConfig.macd.slow}
-                onChange={(e) => handleParamChange('macd', 'slow', Number(e.target.value) || 26)} />
+                onChange={(e) => handleParamChange('macd', 'slow', Math.max(1, Number(e.target.value) || 26))} />
             </div>
             <div>
               <span className={labelCls}>信号</span>
               <input type="number" className={inputCls} value={indConfig.macd.signal}
-                onChange={(e) => handleParamChange('macd', 'signal', Number(e.target.value) || 9)} />
+                onChange={(e) => handleParamChange('macd', 'signal', Math.max(1, Number(e.target.value) || 9))} />
             </div>
           </div>
         </IndicatorRow>
@@ -1680,7 +1680,7 @@ const ChartSettings: React.FC<{ saveConfig: (updates: any) => void }> = ({ saveC
           <div>
             <span className={labelCls}>周期</span>
             <input type="number" className={inputCls} value={indConfig.rsi.period}
-              onChange={(e) => handleParamChange('rsi', 'period', Number(e.target.value) || 14)} />
+              onChange={(e) => handleParamChange('rsi', 'period', Math.max(1, Number(e.target.value) || 14))} />
           </div>
         </IndicatorRow>
 
@@ -1696,17 +1696,17 @@ const ChartSettings: React.FC<{ saveConfig: (updates: any) => void }> = ({ saveC
             <div>
               <span className={labelCls}>周期</span>
               <input type="number" className={inputCls} value={indConfig.kdj.period}
-                onChange={(e) => handleParamChange('kdj', 'period', Number(e.target.value) || 9)} />
+                onChange={(e) => handleParamChange('kdj', 'period', Math.max(1, Number(e.target.value) || 9))} />
             </div>
             <div>
               <span className={labelCls}>K</span>
               <input type="number" className={inputCls} value={indConfig.kdj.k}
-                onChange={(e) => handleParamChange('kdj', 'k', Number(e.target.value) || 3)} />
+                onChange={(e) => handleParamChange('kdj', 'k', Math.max(1, Number(e.target.value) || 3))} />
             </div>
             <div>
               <span className={labelCls}>D</span>
               <input type="number" className={inputCls} value={indConfig.kdj.d}
-                onChange={(e) => handleParamChange('kdj', 'd', Number(e.target.value) || 3)} />
+                onChange={(e) => handleParamChange('kdj', 'd', Math.max(1, Number(e.target.value) || 3))} />
             </div>
           </div>
         </IndicatorRow>
